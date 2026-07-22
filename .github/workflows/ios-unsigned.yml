@@ -3,6 +3,8 @@ name: iOS unsigned build
 "on":
   workflow_dispatch:
   push:
+    branches:
+      - main
     paths:
       - "frontend/ios/**"
       - ".github/workflows/ios-unsigned.yml"
@@ -13,6 +15,10 @@ name: iOS unsigned build
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   RELEASE_VERSION: "1.5.0"

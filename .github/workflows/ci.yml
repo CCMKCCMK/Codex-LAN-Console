@@ -2,6 +2,8 @@ name: Core CI
 
 "on":
   push:
+    branches:
+      - main
     paths:
       - "backend/**"
       - "frontend/web/**"
@@ -18,6 +20,10 @@ name: Core CI
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   windows-bridge:
