@@ -63,4 +63,4 @@ schemes:
       gatherCoverageData: true
       targets:
         - name: CodexLanConsoleTests
-          parallelizable: true
+          parallelizable: false
