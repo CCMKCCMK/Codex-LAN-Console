@@ -4,7 +4,12 @@ enum ServerAddress {
     static func normalize(_ rawValue: String) -> URL? {
         var value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return nil }
-        if !value.lowercased().hasPrefix("http://") && !value.lowercased().hasPrefix("https://") {
+        let lowercaseValue = value.lowercased()
+        if value.contains("://") {
+            guard lowercaseValue.hasPrefix("http://") || lowercaseValue.hasPrefix("https://") else {
+                return nil
+            }
+        } else {
             value = "http://" + value
         }
         guard var components = URLComponents(string: value),
