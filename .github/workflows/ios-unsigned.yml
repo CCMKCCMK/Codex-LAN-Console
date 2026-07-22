@@ -1,0 +1,166 @@
+name: iOS unsigned build
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios-unsigned.yml"
+  pull_request:
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios-unsigned.yml"
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_VERSION: "1.5.0"
+  BUILD_NUMBER: "7"
+  PRODUCT_NAME: "Codex LAN"
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ios
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Select and report build tools
+        shell: bash
+        run: |
+          if [[ -d /Applications/Xcode_16.4.app/Contents/Developer ]]; then
+            echo "DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer" >> "$GITHUB_ENV"
+            export DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer
+          fi
+          xcodebuild -version
+          uname -m
+
+      - name: Install XcodeGen
+        run: |
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Select an available iPhone simulator
+        id: simulator
+        shell: bash
+        run: |
+          SDK_VERSION="$(xcrun --sdk iphonesimulator --show-sdk-version)"
+          xcrun simctl list runtimes available -j > "$RUNNER_TEMP/runtimes.json"
+          RUNTIME_ID="$(python3 - "$RUNNER_TEMP/runtimes.json" "$SDK_VERSION" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          sdk = sys.argv[2]
+          matches = [r["identifier"] for r in data["runtimes"] if r.get("isAvailable") and r.get("version") == sdk]
+          if not matches:
+              raise SystemExit(f"No available simulator runtime matches active SDK {sdk}")
+          print(matches[0])
+          PY
+          )"
+          xcrun simctl list devices available -j > "$RUNNER_TEMP/devices.json"
+          DEVICE_ID="$(python3 - "$RUNNER_TEMP/devices.json" "$RUNTIME_ID" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          devices = data["devices"].get(sys.argv[2], [])
+          matches = [d["udid"] for d in devices if d.get("isAvailable") and d.get("name", "").startswith("iPhone")]
+          if not matches:
+              raise SystemExit(f"No available iPhone for runtime {sys.argv[2]}")
+          print(matches[0])
+          PY
+          )"
+          echo "Using iOS Simulator SDK $SDK_VERSION, runtime $RUNTIME_ID, device $DEVICE_ID"
+          echo "device_id=$DEVICE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Run simulator tests
+        run: >-
+          xcodebuild test
+          -project CodexLanConsole.xcodeproj
+          -scheme CodexLanConsole
+          -configuration Debug
+          -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.device_id }}"
+          -derivedDataPath DerivedData
+          CODE_SIGNING_ALLOWED=NO
+
+      - name: Build unsigned simulator app
+        run: >-
+          xcodebuild build
+          -project CodexLanConsole.xcodeproj
+          -scheme CodexLanConsole
+          -configuration Release
+          -sdk iphonesimulator
+          -destination "generic/platform=iOS Simulator"
+          -derivedDataPath DerivedData
+          CODE_SIGNING_ALLOWED=NO
+
+      - name: Build unsigned iPhoneOS app for later self-signing
+        run: >-
+          xcodebuild build
+          -project CodexLanConsole.xcodeproj
+          -scheme CodexLanConsole
+          -configuration Release
+          -sdk iphoneos
+          -destination "generic/platform=iOS"
+          -derivedDataPath DeviceDerivedData
+          CODE_SIGNING_ALLOWED=NO
+          CODE_SIGNING_REQUIRED=NO
+          AD_HOC_CODE_SIGNING_ALLOWED=NO
+
+      - name: Package simulator artifact
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          ditto -c -k --sequesterRsrc --keepParent \
+            "DerivedData/Build/Products/Release-iphonesimulator/$PRODUCT_NAME.app" \
+            "artifacts/Codex-LAN-Console-iOS-v$RELEASE_VERSION-simulator-unsigned.zip"
+
+      - name: Package unsigned iPhoneOS IPA container
+        shell: bash
+        run: |
+          rm -rf artifacts/Payload
+          mkdir -p artifacts/Payload
+          ditto \
+            "DeviceDerivedData/Build/Products/Release-iphoneos/$PRODUCT_NAME.app" \
+            "artifacts/Payload/$PRODUCT_NAME.app"
+          (cd artifacts && zip -qry "Codex-LAN-Console-iOS-v$RELEASE_VERSION-unsigned.ipa" Payload)
+          rm -rf artifacts/Payload
+
+      - name: Validate unsigned artifacts
+        shell: bash
+        run: |
+          SIM_APP="DerivedData/Build/Products/Release-iphonesimulator/$PRODUCT_NAME.app"
+          DEVICE_APP="DeviceDerivedData/Build/Products/Release-iphoneos/$PRODUCT_NAME.app"
+          IPA="artifacts/Codex-LAN-Console-iOS-v$RELEASE_VERSION-unsigned.ipa"
+          unzip -t "$IPA"
+          unzip -l "$IPA" | grep -F "Payload/$PRODUCT_NAME.app/Info.plist"
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$DEVICE_APP/Info.plist")" == "$RELEASE_VERSION" ]]
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$DEVICE_APP/Info.plist")" == "$BUILD_NUMBER" ]]
+          if codesign -dv "$DEVICE_APP" >/dev/null 2>&1; then
+            echo "Expected an unsigned iPhoneOS app, but a code signature is present" >&2
+            exit 1
+          fi
+          lipo -info "$SIM_APP/$PRODUCT_NAME"
+          lipo -info "$DEVICE_APP/$PRODUCT_NAME"
+
+      - name: Upload unsigned simulator build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Codex-LAN-Console-iOS-v${{ env.RELEASE_VERSION }}-simulator-unsigned
+          path: ios/artifacts/Codex-LAN-Console-iOS-v${{ env.RELEASE_VERSION }}-simulator-unsigned.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload unsigned iPhoneOS build for self-signing
+        uses: actions/upload-artifact@v4
+        with:
+          name: Codex-LAN-Console-iOS-v${{ env.RELEASE_VERSION }}-unsigned-ipa
+          path: ios/artifacts/Codex-LAN-Console-iOS-v${{ env.RELEASE_VERSION }}-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14

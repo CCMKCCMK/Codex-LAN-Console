@@ -1,0 +1,37 @@
+# Build outputs
+**/bin/
+**/obj/
+**/build/
+**/.gradle/
+**/DerivedData/
+release/
+tmp/
+
+# Local SDK and IDE state
+android/local.properties
+.idea/
+.vscode/
+*.user
+*.suo
+*.xcuserstate
+**/xcuserdata/
+
+# Signing credentials must never be committed
+*.jks
+*.keystore
+*.p12
+*.mobileprovision
+*.key
+*.pem
+.env
+.env.*
+secrets*.json
+
+# Release packages belong in the ignored release/ directory
+/*.apk
+/*.ipa
+/*.zip
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db

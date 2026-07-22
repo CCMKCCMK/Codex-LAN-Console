@@ -1,0 +1,38 @@
+plugins { id 'com.android.application' }
+
+def releaseStoreFile = file('../codex-lan-release.jks')
+def releaseStorePassword = System.getenv('CODEX_LAN_KEYSTORE_PASSWORD')
+def releaseKeyPassword = System.getenv('CODEX_LAN_KEY_PASSWORD')
+def releaseKeyAlias = System.getenv('CODEX_LAN_KEY_ALIAS') ?: 'codex-lan'
+def hasReleaseSigning = releaseStoreFile.exists() && releaseStorePassword && releaseKeyPassword
+
+android {
+    namespace 'local.codex.lanconsole'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'local.codex.lanconsole'
+        minSdk 26
+        targetSdk 36
+        versionCode 7
+        versionName '1.5.0'
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile releaseStoreFile
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (hasReleaseSigning) signingConfig signingConfigs.release
+        }
+    }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+}

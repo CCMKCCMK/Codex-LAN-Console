@@ -1,0 +1,218 @@
+/* Mobile containment and system-bar insets. Keep this file small: the shared
+   layout lives in styles.css so desktop and Android are tested against one UI. */
+
+@media (max-width: 699px) {
+  header {
+    position: fixed;
+  }
+
+  main {
+    padding-top: 94px;
+  }
+
+  .auto-approve-banner {
+    position: fixed;
+    top: 76px;
+  }
+
+  body.auto-approval-enabled main {
+    padding-top: 150px;
+  }
+
+  #threadDetail {
+    padding-bottom: 8px;
+  }
+
+  #composer textarea {
+    min-height: 62px;
+    max-height: 30dvh;
+    resize: none;
+  }
+
+  .question-card,
+  .approval-card {
+    padding: 13px;
+  }
+
+  .approval-card .actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .approval-card .actions button {
+    width: 100%;
+  }
+
+  .approval-card .actions .danger:last-child {
+    grid-column: 1 / -1;
+  }
+
+  .approval-automation {
+    padding: 13px;
+  }
+
+  .sectionTitle #approveRecent,
+  .sectionTitle #approveAllPending {
+    max-width: 44vw;
+    overflow: hidden;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .question-submit {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .command-sheet {
+    max-height: 88dvh;
+  }
+
+  .notification-card {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .notification-actions {
+    justify-content: flex-start;
+  }
+
+  .risk-sheet {
+    padding: 17px;
+  }
+}
+
+@media (max-width: 380px) {
+  main {
+    padding-right: 12px;
+    padding-left: 12px;
+  }
+
+  .metrics {
+    gap: 7px;
+  }
+
+  .metrics article {
+    min-height: 86px;
+    padding: 12px 10px;
+  }
+
+  .metrics small {
+    font-size: 11px;
+  }
+
+  .intent-row {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 5px;
+  }
+
+  .intent {
+    width: 100%;
+    padding: 7px 3px;
+    font-size: 12px;
+  }
+
+  .composer-footer {
+    gap: 6px;
+  }
+
+  .composer-footer small {
+    font-size: 11px;
+  }
+
+  .question-submit {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .question-submit button {
+    width: 100%;
+  }
+
+  .attachment-preview {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .composer-tools > small {
+    display: none;
+  }
+
+  .diagnostic {
+    width: calc(100% - 16px);
+  }
+
+  .notification-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .notification-actions button {
+    width: 100%;
+  }
+
+  .approval-card .actions,
+  .risk-actions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .approval-card .actions .danger:last-child {
+    grid-column: auto;
+  }
+
+  .execution-presets {
+    gap: 5px;
+  }
+
+  .execution-presets button {
+    padding-right: 4px;
+    padding-left: 4px;
+    font-size: 11px;
+  }
+
+  .artifact-actions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Android WebView is edge-to-edge on current Xiaomi/Android releases. The app
+   UA marker provides a conservative fallback when CSS safe-area is reported as
+   zero, while ordinary mobile browsers keep their native inset. */
+.native-shell {
+  --native-top: max(env(safe-area-inset-top, 0px), 32px);
+}
+
+.native-shell header {
+  height: calc(76px + var(--native-top));
+  padding-top: calc(14px + var(--native-top));
+}
+
+.native-shell main {
+  padding-top: calc(94px + var(--native-top));
+}
+
+.native-shell .auto-approve-banner {
+  top: calc(76px + var(--native-top));
+}
+
+.native-shell body.auto-approval-enabled main {
+  padding-top: calc(150px + var(--native-top));
+}
+
+.native-shell .diagnostic {
+  top: calc(84px + var(--native-top));
+  max-height: calc(100dvh - 104px - var(--native-top));
+}
+
+.native-shell #composer {
+  padding-bottom: max(10px, env(safe-area-inset-bottom, 0px));
+}
+
+@supports not (height: 100dvh) {
+  .dialog {
+    max-height: calc(100vh - 40px);
+  }
+
+  textarea,
+  #composer textarea {
+    max-height: 32vh;
+  }
+}

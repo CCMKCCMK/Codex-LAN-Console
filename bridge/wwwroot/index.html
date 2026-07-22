@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0c0f0e"><title>Codex LAN Console</title>
+  <link rel="manifest" href="/manifest.webmanifest"><link rel="stylesheet" href="/styles.css?v=27"><link rel="stylesheet" href="/mobile.css?v=27">
+</head>
+<body>
+  <div id="pair" class="overlay hidden">
+    <form id="pairForm" class="dialog">
+      <div class="logo">C</div><h1>连接电脑</h1>
+      <p>输入电脑上 Codex LAN Console 显示的 6 位配对码。无需任何云端账号。</p>
+      <input id="code" inputmode="numeric" maxlength="6" pattern="[0-9]{6}" placeholder="000000" required>
+      <button>配对这台手机</button><small id="pairError"></small>
+    </form>
+  </div>
+
+  <header><div><span class="eyebrow">LOCAL ONLY · 1.5.0</span><h1>Codex Console</h1></div><button id="refresh" class="icon">↻</button></header>
+  <aside id="autoApproveBanner" class="auto-approve-banner hidden" role="status" aria-live="polite">
+    <div><b>自动允许后续审批已开启</b><small>Console 管理的新审批会直接选择 Yes；需要回答的问题不会自动处理。</small></div>
+    <button type="button" id="manageAutoApprove" class="secondary">管理</button>
+  </aside>
+  <aside id="diagnostic" class="diagnostic hidden" role="alert" aria-live="assertive">
+    <div class="diagnostic-heading"><div><small>电脑端返回错误</small><h2 id="diagnosticTitle">操作没有完成</h2></div><button type="button" id="diagnosticClose" class="icon" aria-label="关闭错误详情">×</button></div>
+    <p id="diagnosticMessage"></p>
+    <details><summary>查看诊断信息</summary><pre id="diagnosticDetails"></pre></details>
+    <div class="diagnostic-actions"><button type="button" id="diagnosticCopy">复制诊断信息</button><button type="button" id="diagnosticRefresh">重新加载</button></div>
+  </aside>
+  <main>
+    <section id="overview" class="page active">
+      <div class="status"><i id="dot"></i><div><b id="machine">正在连接</b><small id="state">检查本地桥接服务</small></div></div>
+      <section id="notificationCard" class="notification-card hidden" aria-live="polite">
+        <div class="notification-copy">
+          <div class="notification-heading"><h2>后台通知</h2><span id="notificationBadge" class="notification-badge">未开启</span></div>
+          <p id="notificationMessage">开启后会保留一条低打扰的后台连接状态，并在任务完成或需要你决定时提醒。</p>
+        </div>
+        <div class="notification-actions">
+          <button type="button" id="notificationAction">开启通知</button>
+          <button type="button" id="notificationTest" class="secondary hidden">试一下</button>
+          <button type="button" id="notificationSettings" class="secondary hidden">系统设置</button>
+        </div>
+      </section>
+      <div class="metrics"><article><b id="threadCount">-</b><small>最近任务</small></article><article><b id="projectCount">-</b><small>项目</small></article><article><b id="processCount">-</b><small>相关进程</small></article></div>
+      <div class="sectionTitle"><h2>最近任务</h2><button onclick="showPage('threads')">查看全部</button></div><div id="recentThreads" class="list"></div>
+      <div class="sectionTitle"><h2>待处理审批</h2><button id="approveRecent" class="hidden">一键允许全部待审批</button></div><div id="recentApprovals" class="list"></div>
+    </section>
+    <section id="threads" class="page"><div class="sectionTitle"><h2>任务</h2><button id="newThread">新建</button></div><div id="threadList" class="list"></div></section>
+    <section id="projects" class="page"><div class="sectionTitle"><h2>项目</h2></div><div id="projectList" class="list"></div></section>
+    <section id="processes" class="page"><div class="sectionTitle"><h2>相关进程</h2><button id="reloadProcesses">刷新</button></div><p class="hint">只展示开发相关进程。停止进程前必须输入确认文本。</p><div id="processList" class="list"></div></section>
+    <section id="approvals" class="page">
+      <div class="sectionTitle"><h2>审批</h2><button id="approveAllPending" class="hidden">一键允许全部待审批</button></div>
+      <section id="approvalAutomation" class="approval-automation card" aria-live="polite">
+        <div class="approval-automation-heading"><div><small>后续请求</small><h3>自动批准</h3></div><span id="autoApproveBadge" class="notification-badge">已关闭</span></div>
+        <p id="autoApproveDescription">开启后，电脑端桥接服务会对 Console 管理的新审批自动选择允许。需要你回答的问题仍会停下来。</p>
+        <label class="switch-row" for="autoApproveAll">
+          <span><b>自动允许后续审批</b><small>这是“全部点 Yes”，不是 Codex 风险审核。</small></span>
+          <input id="autoApproveAll" type="checkbox" role="switch" aria-describedby="autoApproveDescription">
+        </label>
+      </section>
+      <div id="approvalList" class="list"></div>
+    </section>
+    <section id="threadDetail" class="page">
+      <button class="back" onclick="CodexConsoleHandleBack()">← 返回</button><h2 id="detailTitle">任务</h2>
+      <div id="turns" class="turns"></div><div id="detailPending" class="pending-stack"></div>
+      <form id="composer">
+        <div class="intent-row" role="group" aria-label="指令类型">
+          <button type="button" class="intent active" data-intent="plain">直接</button>
+          <button type="button" class="intent" data-intent="continue">继续</button>
+          <button type="button" class="intent" data-intent="fix">修复</button>
+          <button type="button" class="intent" data-intent="explain">解释</button>
+          <button type="button" class="intent" data-intent="test">测试</button>
+        </div>
+        <div class="composer-tools">
+          <button type="button" id="commandTrigger" class="secondary">⌘ 快捷操作</button>
+          <label class="attachment-trigger" for="attachmentInput">＋ 添加附件<input id="attachmentInput" class="visually-hidden" type="file" multiple accept="*/*"></label>
+          <small>最多 10 个</small>
+        </div>
+        <div id="selectedCommands" class="selected-commands hidden" aria-label="已选择的能力"></div>
+        <div id="attachmentPreview" class="attachment-preview hidden" aria-live="polite"></div>
+        <textarea id="message" rows="2" enterkeyhint="send" placeholder="你希望 Codex 做什么？也可以只添加附件。"></textarea>
+        <details id="composerDetails">
+          <summary>添加细节</summary>
+          <label>涉及的文件或功能<input id="messageScope" placeholder="例如：登录页、app.js 或端口映射"></label>
+          <label>操作范围<select id="messagePolicy"><option value="">按任务需要处理</option><option value="analysis">只分析，不修改</option><option value="edit">可以修改文件</option><option value="verify">可以修改，完成后测试并验收</option></select></label>
+          <label>完成标准<input id="messageDone" placeholder="例如：手机窄屏无横向滚动"></label>
+          <div class="execution-presets" role="group" aria-label="运行预设">
+            <button type="button" data-execution-preset="reviewed">安全审核</button>
+            <button type="button" data-execution-preset="workspace-autonomous">项目自主</button>
+            <button type="button" data-execution-preset="unrestricted">完全自主</button>
+          </div>
+          <div class="execution-settings">
+            <label>文件与系统权限<select id="runtimePermission"><option value=":read-only">只读（禁止修改）</option><option value=":workspace" selected>项目范围（沙箱）</option><option value=":danger-full-access">整台电脑（无沙箱）</option></select></label>
+            <label>遇到风险操作时<select id="approvalMode"><option value="auto" selected>交给 Codex 审核（不是全同意）</option><option value="ask">在手机上问我</option><option value="never">不发起审批，直接运行</option><option value="strict">更多操作都问我</option></select></label>
+          </div>
+          <p id="permissionHint" class="permission-hint">项目沙箱限制修改范围；Codex 风险审核会逐项判断，并不是全部同意。</p>
+        </details>
+        <div class="composer-footer"><button type="button" id="interruptTurn" class="danger hidden">停止</button><small id="sendMode">发送新的指令</small><button id="sendMessage" type="submit">发送</button></div>
+      </form>
+    </section>
+  </main>
+  <nav><button data-page="overview" class="active">⌂<span>概览</span></button><button data-page="threads">◎<span>任务</span></button><button data-page="projects">◇<span>项目</span></button><button data-page="processes">▥<span>进程</span></button><button data-page="approvals">✓<span>审批</span></button></nav>
+  <div id="commandPanel" class="command-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="commandTitle">
+    <button type="button" class="command-backdrop" aria-label="关闭快捷操作"></button>
+    <section class="command-sheet">
+      <div class="command-sheet-heading"><div><small>无需手写命令</small><h2 id="commandTitle">选择下一步操作</h2></div><button type="button" id="commandClose" class="icon" aria-label="关闭">×</button></div>
+      <input id="commandSearch" type="search" autocomplete="off" placeholder="搜索操作、工具或技能">
+      <div id="commandList" class="command-list"></div>
+    </section>
+  </div>
+  <div id="riskPanel" class="command-overlay risk-overlay hidden" role="alertdialog" aria-modal="true" aria-labelledby="riskTitle" aria-describedby="riskMessage">
+    <button type="button" id="riskBackdrop" class="command-backdrop" aria-label="取消"></button>
+    <section class="risk-sheet">
+      <span class="risk-label">高风险设置</span>
+      <h2 id="riskTitle">确认启用</h2>
+      <p id="riskMessage"></p>
+      <ul id="riskConsequences"></ul>
+      <label class="risk-acknowledgement"><input id="riskAcknowledged" type="checkbox"><span>我明白以上影响，并确认由我主动启用。</span></label>
+      <div class="risk-actions"><button type="button" id="riskCancel" class="secondary">取消</button><button type="button" id="riskConfirm" class="danger" disabled>确认启用</button></div>
+    </section>
+  </div>
+  <div id="toast"></div><script src="/marked.umd.js?v=27"></script><script src="/app.js?v=27"></script>
+</body></html>
