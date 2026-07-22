@@ -2,6 +2,28 @@
 
 Codex LAN Console 用安卓手机或 iPhone 查看和控制这台 Windows 电脑上已经登录的 Codex/ChatGPT 编程环境。手机端不需要再登录 OpenAI、Google 或 Microsoft 账号。
 
+## 仓库结构
+
+源码按前端和后端清晰分层，但仍保持单个 Windows 服务部署，避免引入额外端口、CORS 或第二套认证：
+
+```text
+frontend/
+  web/       手机共用的响应式 Web 界面
+  android/   Android 原生 WebView 外壳与后台通知
+  ios/       iOS 原生 WKWebView 外壳与自签名工程
+backend/
+  bridge/       Windows API、认证、Codex app-server 和静态文件托管
+  bridge.tests/ Bridge 协议测试
+```
+
+Web 前端在构建时复制进 Windows Bridge 的 `wwwroot`，所以最终用户仍只需启动一个程序。完整边界与数据流见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+
+## 项目状态与许可
+
+本仓库目前是私有预发布项目，原创代码保留全部权利，只允许获得授权的测试者按 [`BETA_EULA.md`](BETA_EULA.md) 进行测试；第三方组件仍按各自许可证使用，详见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。正式公开前会完成独立品牌、安全审计与许可证决策，检查项见 [`docs/PUBLIC_RELEASE_CHECKLIST.md`](docs/PUBLIC_RELEASE_CHECKLIST.md)。
+
+本项目是独立开发的软件，不隶属于 OpenAI 或 UC San Diego，也未得到其赞助或认可。使用前请阅读 [`SECURITY.md`](SECURITY.md)、[`PRIVACY.md`](PRIVACY.md) 与 [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)。
+
 ## 1.5.0 的主要改进
 
 ### 真正的权限模式
@@ -29,7 +51,7 @@ Codex LAN Console 用安卓手机或 iPhone 查看和控制这台 Windows 电脑
 
 - 新增原生 Swift/WKWebView 客户端，复用同一套任务、审批、上传、下载、Markdown、命令和权限界面。
 - GitHub Actions 在 macOS 上编译无签名的真机 IPA 和模拟器 App；项目不保存任何 Apple 证书或开发者账号。
-- iPhone 真机安装必须由使用者使用自己的 Apple Account/Developer Team 签名。完整步骤见 [`ios/README.md`](ios/README.md)。
+- iPhone 真机安装必须由使用者使用自己的 Apple Account/Developer Team 签名。完整步骤见 [`frontend/ios/README.md`](frontend/ios/README.md)。
 - iOS 会在 App 活跃以及系统给予后台刷新机会时检查任务并发出本地通知。Apple 不允许普通未配置推送服务的 App 像 Android 前台服务那样持续后台轮询，因此锁屏后的即时性不能保证。
 
 ## 1.4.0 的主要改进
@@ -118,7 +140,7 @@ Codex LAN Console 用安卓手机或 iPhone 查看和控制这台 Windows 电脑
 - 安卓 App：`Codex-LAN-Console-v1.5.0.apk`
 - iOS 真机包：GitHub Actions 生成的 `Codex-LAN-Console-iOS-v1.5.0-unsigned.ipa`（必须自行签名）
 - iOS 模拟器包：GitHub Actions 生成的 `Codex-LAN-Console-iOS-v1.5.0-simulator-unsigned.zip`
-- iOS 自行签名源码：`Codex-LAN-Console-iOS-v1.5.0-source.zip`（推荐在 Mac 上解压后按 `ios/README.md` 用自己的 Team 构建）
+- iOS 自行签名源码：`Codex-LAN-Console-iOS-v1.5.0-source.zip`（推荐在 Mac 上解压后按 `frontend/ios/README.md` 用自己的 Team 构建）
 - 本地端口：TCP 8787
 - 配对数据、通知事件和上传文件：`%LOCALAPPDATA%\CodexLanConsole`
 - 安卓要求：Android 8.0 或更高版本
@@ -160,7 +182,25 @@ Codex LAN Console 用安卓手机或 iPhone 查看和控制这台 Windows 电脑
 
 Windows 不能为 iPhone 生成可直接安装的受信任签名。仓库中的 macOS 工作流只负责验证源码并生成无签名构建物，不接收、不保存也不代管 Apple 证书。
 
-最稳妥的安装方式是在 Mac 上用 Xcode 打开 `ios/CodexLanConsole.xcodeproj`（若项目文件尚未生成，先按 `ios/README.md` 运行 XcodeGen），把 Bundle Identifier 改成自己的唯一值，选择自己的 Team，保持 Automatically manage signing 开启，然后连接 iPhone 运行。详细步骤和 GitHub Actions 用法见 [`ios/README.md`](ios/README.md)。
+最稳妥的安装方式是在 Mac 上用 Xcode 打开 `frontend/ios/CodexLanConsole.xcodeproj`（若项目文件尚未生成，先按 `frontend/ios/README.md` 运行 XcodeGen），把 Bundle Identifier 改成自己的唯一值，选择自己的 Team，保持 Automatically manage signing 开启，然后连接 iPhone 运行。详细步骤和 GitHub Actions 用法见 [`frontend/ios/README.md`](frontend/ios/README.md)。
+
+## 开发与构建
+
+Windows Bridge 与协议测试：
+
+```powershell
+dotnet build CodexLanConsole.sln -c Release
+dotnet run --project backend\bridge.tests\CodexLanBridge.ProtocolTests.csproj -c Release
+```
+
+Android 调试构建：
+
+```powershell
+Set-Location frontend\android
+.\gradlew.bat lintDebug assembleDebug --no-daemon
+```
+
+iOS 项目需要 macOS、Xcode 16 和 XcodeGen；Windows 上提交源码后，由 `.github/workflows/ios-unsigned.yml` 完成模拟器测试和无签名构建。
 
 ## 常见问题
 

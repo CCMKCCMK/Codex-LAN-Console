@@ -4,11 +4,11 @@ name: iOS unsigned build
   workflow_dispatch:
   push:
     paths:
-      - "ios/**"
+      - "frontend/ios/**"
       - ".github/workflows/ios-unsigned.yml"
   pull_request:
     paths:
-      - "ios/**"
+      - "frontend/ios/**"
       - ".github/workflows/ios-unsigned.yml"
 
 permissions:
@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
-        working-directory: ios
+        working-directory: frontend/ios
 
     steps:
       - name: Check out repository
@@ -154,7 +154,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Codex-LAN-Console-iOS-v${{ env.RELEASE_VERSION }}-simulator-unsigned
-          path: ios/artifacts/Codex-LAN-Console-iOS-v${{ env.RELEASE_VERSION }}-simulator-unsigned.zip
+          path: frontend/ios/artifacts/Codex-LAN-Console-iOS-v${{ env.RELEASE_VERSION }}-simulator-unsigned.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -162,6 +162,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Codex-LAN-Console-iOS-v${{ env.RELEASE_VERSION }}-unsigned-ipa
-          path: ios/artifacts/Codex-LAN-Console-iOS-v${{ env.RELEASE_VERSION }}-unsigned.ipa
+          path: frontend/ios/artifacts/Codex-LAN-Console-iOS-v${{ env.RELEASE_VERSION }}-unsigned.ipa
           if-no-files-found: error
           retention-days: 14

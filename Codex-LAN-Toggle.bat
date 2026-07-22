@@ -8,12 +8,12 @@ if exist "%ROOT%release\WindowsBridge\CodexLanBridge.exe" (
 ) else if exist "%ROOT%WindowsBridge\CodexLanBridge.exe" (
   set "BRIDGE=%ROOT%WindowsBridge\CodexLanBridge.exe"
   set "WORKDIR=%ROOT%WindowsBridge"
-) else if exist "%ROOT%bridge\bin\Release\net8.0\CodexLanBridge.exe" (
-  set "BRIDGE=%ROOT%bridge\bin\Release\net8.0\CodexLanBridge.exe"
-  set "WORKDIR=%ROOT%bridge\bin\Release\net8.0"
+) else if exist "%ROOT%backend\bridge\bin\Release\net8.0\CodexLanBridge.exe" (
+  set "BRIDGE=%ROOT%backend\bridge\bin\Release\net8.0\CodexLanBridge.exe"
+  set "WORKDIR=%ROOT%backend\bridge\bin\Release\net8.0"
 ) else (
-  set "BRIDGE=%ROOT%bridge\bin\Release\net8.0\CodexLanBridge.exe"
-  set "WORKDIR=%ROOT%bridge\bin\Release\net8.0"
+  set "BRIDGE=%ROOT%backend\bridge\bin\Release\net8.0\CodexLanBridge.exe"
+  set "WORKDIR=%ROOT%backend\bridge\bin\Release\net8.0"
 )
 set "PAIRING_FILE=%LOCALAPPDATA%\CodexLanConsole\pairing.txt"
 if /I "%~1"=="status" goto status

@@ -8,7 +8,7 @@ release/
 tmp/
 
 # Local SDK and IDE state
-android/local.properties
+frontend/android/local.properties
 .idea/
 .vscode/
 *.user

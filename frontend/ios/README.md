@@ -31,7 +31,7 @@ Signing is intentionally not included. Apple requires the person installing the 
 3. Clone or copy this repository, then generate the Xcode project:
 
    ```sh
-   cd CodexLanConsole/ios
+   cd CodexLanConsole/frontend/ios
    xcodegen generate --spec project.yml
    open CodexLanConsole.xcodeproj
    ```

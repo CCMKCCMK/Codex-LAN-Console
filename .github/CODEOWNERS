@@ -1,0 +1,18 @@
+# The private-preview owner reviews every change.
+* @CCMKCCMK
+
+# Protect governance, security, and release control explicitly.
+/.github/ @CCMKCCMK
+/LICENSE @CCMKCCMK
+/LICENSES/ @CCMKCCMK
+/BETA_EULA.md @CCMKCCMK
+/NOTICE.md @CCMKCCMK
+/THIRD_PARTY_NOTICES.md @CCMKCCMK
+/SECURITY.md @CCMKCCMK
+/PRIVACY.md @CCMKCCMK
+/RELEASE_POLICY.md @CCMKCCMK
+/docs/ @CCMKCCMK
+
+# Component ownership during the private preview.
+/frontend/ @CCMKCCMK
+/backend/ @CCMKCCMK

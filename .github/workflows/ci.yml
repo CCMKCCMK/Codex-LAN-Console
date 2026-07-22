@@ -1,0 +1,94 @@
+name: Core CI
+
+"on":
+  push:
+    paths:
+      - "backend/**"
+      - "frontend/web/**"
+      - "frontend/android/**"
+      - "CodexLanConsole.sln"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+      - "frontend/web/**"
+      - "frontend/android/**"
+      - "CodexLanConsole.sln"
+      - ".github/workflows/ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  windows-bridge:
+    name: Windows bridge and web
+    runs-on: windows-2025
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Build solution
+        run: dotnet build CodexLanConsole.sln -c Release
+
+      - name: Run protocol tests
+        run: dotnet run --project backend/bridge.tests/CodexLanBridge.ProtocolTests.csproj -c Release --no-build
+
+      - name: Validate browser JavaScript
+        run: node --check frontend/web/app.js
+
+      - name: Publish Windows bridge
+        run: >-
+          dotnet publish backend/bridge/CodexLanBridge.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -o artifacts/windows
+
+      - name: Verify bundled web application
+        shell: pwsh
+        run: |
+          $required = @(
+            "index.html",
+            "app.js",
+            "styles.css",
+            "mobile.css",
+            "manifest.webmanifest",
+            "sw.js"
+          )
+          foreach ($file in $required) {
+            $path = Join-Path "artifacts/windows/wwwroot" $file
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Missing bundled web asset: $path"
+            }
+          }
+
+  android:
+    name: Android lint and debug build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: frontend/android
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Build and lint Android client
+        run: ./gradlew lintDebug assembleDebug --no-daemon

@@ -3,7 +3,7 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $exe = @(
     (Join-Path $root 'release\WindowsBridge\CodexLanBridge.exe')
     (Join-Path $root 'WindowsBridge\CodexLanBridge.exe')
-    (Join-Path $root 'bridge\bin\Release\net8.0\CodexLanBridge.exe')
+    (Join-Path $root 'backend\bridge\bin\Release\net8.0\CodexLanBridge.exe')
 ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if (-not $exe -or -not (Test-Path -LiteralPath $exe)) {
     throw "Bridge executable was not found under: $root"
