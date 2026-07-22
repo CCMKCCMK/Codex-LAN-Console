@@ -24,7 +24,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: local.codex.lanconsole.ios
-        PRODUCT_NAME: Codex LAN
+        PRODUCT_NAME: CodexLanConsole
         PRODUCT_MODULE_NAME: CodexLanConsole
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: CodexLanConsole/Info.plist

@@ -17,7 +17,7 @@ permissions:
 env:
   RELEASE_VERSION: "1.5.0"
   BUILD_NUMBER: "7"
-  PRODUCT_NAME: "Codex LAN"
+  PRODUCT_NAME: "CodexLanConsole"
 
 jobs:
   build-and-test:
