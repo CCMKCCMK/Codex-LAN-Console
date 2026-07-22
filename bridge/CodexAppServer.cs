@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
+using System.Buffers;
 using System.Diagnostics;
+using System.IO.Pipelines;
 using System.Text;
 using System.Text.Json;
 
@@ -19,6 +21,11 @@ public sealed record ApprovalBatchResult(
 
 public sealed class CodexAppServer : BackgroundService
 {
+    // App-server messages are newline-delimited JSON. A malformed or legacy request can
+    // otherwise materialize an entire multi-gigabyte rollout in this bridge process.
+    // Mobile responses are deliberately compact, so 32 MiB is a generous safety ceiling.
+    public const long MaximumAppServerMessageBytes = 32L * 1024 * 1024;
+
     private readonly NotificationStore _notifications;
     private readonly ThreadRuntimeStateStore _runtimeStates;
     private readonly ApprovalSettingsStore _approvalSettings;
@@ -129,46 +136,92 @@ public sealed class CodexAppServer : BackgroundService
 
     private async Task ReadLoop(Process process, CancellationToken ct)
     {
-        while (!ct.IsCancellationRequested && !process.HasExited)
+        var reader = PipeReader.Create(
+            process.StandardOutput.BaseStream,
+            new StreamPipeReaderOptions(
+                bufferSize: 64 * 1024,
+                minimumReadSize: 4 * 1024,
+                leaveOpen: true));
+        try
         {
-            var line = await process.StandardOutput.ReadLineAsync(ct);
-            if (line is null) break;
-            try
+            while (!ct.IsCancellationRequested && !process.HasExited)
             {
-                using var doc = JsonDocument.Parse(line);
-                var root = doc.RootElement;
-                if (root.TryGetProperty("id", out var id) && root.TryGetProperty("result", out var result) && id.ValueKind == JsonValueKind.Number)
+                var read = await reader.ReadAsync(ct);
+                var remaining = read.Buffer;
+                while (remaining.PositionOf((byte)'\n') is { } newline)
                 {
-                    if (_calls.TryRemove(id.GetInt64(), out var tcs)) tcs.TrySetResult(result.Clone());
+                    var line = remaining.Slice(0, newline);
+                    remaining = remaining.Slice(remaining.GetPosition(1, newline));
+                    ThrowIfMessageTooLarge(line.Length);
+                    if (line.Length > 0) await ProcessMessageAsync(TrimCarriageReturn(line));
                 }
-                else if (root.TryGetProperty("id", out id) && root.TryGetProperty("error", out var error) && id.ValueKind == JsonValueKind.Number)
+
+                ThrowIfMessageTooLarge(remaining.Length);
+                if (read.IsCompleted && remaining.Length > 0)
                 {
-                    if (_calls.TryRemove(id.GetInt64(), out var tcs)) tcs.TrySetException(new CodexRpcException(error.Clone()));
+                    await ProcessMessageAsync(TrimCarriageReturn(remaining));
+                    remaining = remaining.Slice(remaining.End);
                 }
-                else if (root.TryGetProperty("id", out id) && root.TryGetProperty("method", out var method))
+                reader.AdvanceTo(remaining.Start, remaining.End);
+                if (read.IsCompleted) break;
+            }
+        }
+        finally
+        {
+            await reader.CompleteAsync();
+        }
+    }
+
+    private async Task ProcessMessageAsync(ReadOnlySequence<byte> line)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(line);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("id", out var id) && root.TryGetProperty("result", out var result) && id.ValueKind == JsonValueKind.Number)
+            {
+                if (_calls.TryRemove(id.GetInt64(), out var tcs)) tcs.TrySetResult(result.Clone());
+            }
+            else if (root.TryGetProperty("id", out id) && root.TryGetProperty("error", out var error) && id.ValueKind == JsonValueKind.Number)
+            {
+                if (_calls.TryRemove(id.GetInt64(), out var tcs)) tcs.TrySetException(new CodexRpcException(error.Clone()));
+            }
+            else if (root.TryGetProperty("id", out id) && root.TryGetProperty("method", out var method))
+            {
+                var key = Guid.NewGuid().ToString("N");
+                var p = root.TryGetProperty("params", out var param) ? param.Clone() : JsonSerializer.SerializeToElement(new { });
+                var pending = new PendingRequest(key, method.GetString() ?? "request", p, DateTimeOffset.UtcNow);
+                Pending[key] = pending;
+                _requestIds[key] = id.Clone();
+                ObservePendingState(pending);
+                var autoApproval = await TryAutoApproveAsync(pending);
+                if (ApprovalProtocol.ShouldPublishPendingNotification(
+                        autoApproval,
+                        Pending.ContainsKey(pending.Key)))
                 {
-                    var key = Guid.NewGuid().ToString("N");
-                    var p = root.TryGetProperty("params", out var param) ? param.Clone() : JsonSerializer.SerializeToElement(new { });
-                    var pending = new PendingRequest(key, method.GetString() ?? "request", p, DateTimeOffset.UtcNow);
-                    Pending[key] = pending;
-                    _requestIds[key] = id.Clone();
-                    ObservePendingState(pending);
-                    var autoApproval = await TryAutoApproveAsync(pending);
-                    if (ApprovalProtocol.ShouldPublishPendingNotification(
-                            autoApproval,
-                            Pending.ContainsKey(pending.Key)))
-                    {
-                        _notifications.PublishPending(pending);
-                    }
-                }
-                else if (root.TryGetProperty("method", out method) && method.ValueKind == JsonValueKind.String)
-                {
-                    var p = root.TryGetProperty("params", out var param) ? param : default;
-                    HandleNotification(method.GetString() ?? "", p);
+                    _notifications.PublishPending(pending);
                 }
             }
-            catch (Exception ex) { Console.Error.WriteLine($"Invalid app-server message: {ex.Message}"); }
+            else if (root.TryGetProperty("method", out method) && method.ValueKind == JsonValueKind.String)
+            {
+                var p = root.TryGetProperty("params", out var param) ? param : default;
+                HandleNotification(method.GetString() ?? "", p);
+            }
         }
+        catch (JsonException ex) { Console.Error.WriteLine($"Invalid app-server message: {ex.Message}"); }
+    }
+
+    public static void ThrowIfMessageTooLarge(long length)
+    {
+        if (length > MaximumAppServerMessageBytes)
+            throw new AppServerMessageTooLargeException(length, MaximumAppServerMessageBytes);
+    }
+
+    private static ReadOnlySequence<byte> TrimCarriageReturn(ReadOnlySequence<byte> line)
+    {
+        if (line.Length == 0) return line;
+        var last = line.Slice(line.Length - 1, 1).FirstSpan[0];
+        return last == (byte)'\r' ? line.Slice(0, line.Length - 1) : line;
     }
 
     private readonly ConcurrentDictionary<string, JsonElement> _requestIds = new();
@@ -316,7 +369,7 @@ public sealed class CodexAppServer : BackgroundService
         try
         {
             if (!force && _loadedThreads.ContainsKey(threadId)) return;
-            var result = await CallAsync("thread/resume", new { threadId }, cancellationToken);
+            var result = await CallAsync("thread/resume", new { threadId, excludeTurns = true }, cancellationToken);
             MarkThreadLoaded(result);
             _loadedThreads[threadId] = 0;
         }

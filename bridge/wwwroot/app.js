@@ -18,7 +18,6 @@ let authenticated = false;
 let currentThread = '';
 let currentThreadCwd = '';
 let currentTurns = [];
-let currentTurnStart = 0;
 let currentTurnCursor = '';
 let currentActiveTurnId = '';
 let currentRuntimeState = null;
@@ -838,12 +837,10 @@ function renderThreadHistory(preserve = false) {
 }
 
 async function loadOlder() {
-  if (!hasEarlierTurns || loadingOlder || !currentThread) return;
+  if (!hasEarlierTurns || loadingOlder || !currentThread || !currentTurnCursor) return;
   loadingOlder = true;
   const threadId = currentThread;
-  const pagination = currentTurnCursor
-    ? `paged=true&cursor=${encodeURIComponent(currentTurnCursor)}`
-    : `before=${currentTurnStart}`;
+  const pagination = `paged=true&cursor=${encodeURIComponent(currentTurnCursor)}`;
   const button = document.querySelector('.load-older');
   if (button) {
     button.disabled = true;
@@ -854,7 +851,6 @@ async function loadOlder() {
     if (threadId !== currentThread) return;
     const thread = result.thread || result;
     currentTurns = [...(thread.turns || []), ...currentTurns];
-    currentTurnStart = result.start ?? 0;
     currentTurnCursor = result.nextCursor || '';
     hasEarlierTurns = Boolean(result.hasEarlier);
     currentThreadSignature = JSON.stringify(currentTurns);
@@ -2097,7 +2093,6 @@ async function refreshCurrentThread(background = false) {
   const nextTurns = thread.turns || [];
   const nextSignature = JSON.stringify(nextTurns);
   currentTurns = nextTurns;
-  currentTurnStart = result.start ?? 0;
   currentTurnCursor = result.nextCursor || '';
   hasEarlierTurns = Boolean(result.hasEarlier);
   currentRuntimeState = result.runtimeState || runtimeStates[threadId] || normalizedRuntimeState(thread);

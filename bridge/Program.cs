@@ -214,45 +214,48 @@ app.MapGet("/api/threads/{id}", async (
     var pageSize = Math.Clamp(limit ?? 6, 1, 20);
     if (cursor?.Length > 4096) throw new ArgumentException("The turn cursor is too long.");
 
-    // Updated clients opt into cursor pagination. Calls without `paged` retain the legacy
-    // numeric `before` contract so cached/older mobile clients continue to work.
-    if (paged == true || cursor is not null)
+    // Full-history reads can materialize multi-gigabyte rollout files. Never fall back to
+    // a full-history RPC; cached clients must refresh to the cursor-paginated UI.
+    if (paged != true && cursor is null)
     {
-        var metadata = await codex.CallAsync(
-            "thread/read",
-            new { threadId = id, includeTurns = false },
-            cancellationToken);
-        try
+        return Results.Json(new
         {
-            var turnPage = await codex.CallAsync(
-                "thread/turns/list",
-                new
-                {
-                    threadId = id,
-                    cursor,
-                    limit = pageSize,
-                    sortDirection = "desc",
-                    itemsView = "summary"
-                },
-                cancellationToken);
-            return Results.Ok(ApiHelpers.PagedThread(metadata, turnPage, id, runtimeStates.Get(id)));
-        }
-        catch (CodexRpcException ex) when (ApiHelpers.IsUnmaterializedThread(ex))
-        {
-            return Results.Ok(ApiHelpers.PagedThread(metadata, default, id, runtimeStates.Get(id)));
-        }
-        catch (CodexRpcException ex) when (ex.Code == -32601)
-        {
-            // Older app-server builds do not expose turn pagination. Fall through to the
-            // bounded legacy response instead of failing the whole mobile detail page.
-        }
+            error = "This cached client uses unsafe full-history loading. Refresh or update Codex LAN Console.",
+            kind = "cursorPaginationRequired"
+        }, statusCode: StatusCodes.Status426UpgradeRequired);
     }
 
-    var legacy = await codex.CallAsync(
+    var metadata = await codex.CallAsync(
         "thread/read",
-        new { threadId = id, includeTurns = true },
+        new { threadId = id, includeTurns = false },
         cancellationToken);
-    return Results.Ok(ApiHelpers.LegacyThreadPage(legacy, id, before, pageSize, runtimeStates.Get(id)));
+    try
+    {
+        var turnPage = await codex.CallAsync(
+            "thread/turns/list",
+            new
+            {
+                threadId = id,
+                cursor,
+                limit = pageSize,
+                sortDirection = "desc",
+                itemsView = "summary"
+            },
+            cancellationToken);
+        return Results.Ok(ApiHelpers.PagedThread(metadata, turnPage, id, runtimeStates.Get(id)));
+    }
+    catch (CodexRpcException ex) when (ApiHelpers.IsUnmaterializedThread(ex))
+    {
+        return Results.Ok(ApiHelpers.PagedThread(metadata, default, id, runtimeStates.Get(id)));
+    }
+    catch (CodexRpcException ex) when (ex.Code == -32601)
+    {
+        return Results.Json(new
+        {
+            error = "The installed Codex app-server does not support safe turn pagination. Update Codex before opening task history remotely.",
+            kind = "codexUpgradeRequired"
+        }, statusCode: StatusCodes.Status501NotImplemented);
+    }
 });
 
 app.MapGet("/api/permissions", async (

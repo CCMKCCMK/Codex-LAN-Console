@@ -15,6 +15,19 @@ PendingRequest Pending(string method, string parameters = "{}") => new(
     JsonDocument.Parse(parameters).RootElement.Clone(),
     DateTimeOffset.UtcNow);
 
+var exactLimitWasAccepted = true;
+try { CodexAppServer.ThrowIfMessageTooLarge(CodexAppServer.MaximumAppServerMessageBytes); }
+catch { exactLimitWasAccepted = false; }
+Assert(exactLimitWasAccepted, "A response exactly at the safety limit must be accepted.");
+var oversizedWasRejected = false;
+try { CodexAppServer.ThrowIfMessageTooLarge(CodexAppServer.MaximumAppServerMessageBytes + 1); }
+catch (AppServerMessageTooLargeException ex)
+{
+    oversizedWasRejected = ex.ActualBytes == CodexAppServer.MaximumAppServerMessageBytes + 1 &&
+                           ex.MaximumBytes == CodexAppServer.MaximumAppServerMessageBytes;
+}
+Assert(oversizedWasRejected, "An oversized app-server response must be rejected before parsing.");
+
 var unrestricted = ExecutionPermissions.Parse(":danger-full-access", "never", "auto_review");
 Assert(unrestricted.Permissions == ":danger-full-access", "Full-access profile was not preserved.");
 Assert(unrestricted.ApprovalPolicy == "never", "Never-approve policy was not preserved.");
