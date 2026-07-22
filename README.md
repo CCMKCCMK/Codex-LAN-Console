@@ -112,6 +112,7 @@ Codex LAN Console 用安卓手机或 iPhone 查看和控制这台 Windows 电脑
 - 安卓 App：`Codex-LAN-Console-v1.5.0.apk`
 - iOS 真机包：GitHub Actions 生成的 `Codex-LAN-Console-iOS-v1.5.0-unsigned.ipa`（必须自行签名）
 - iOS 模拟器包：GitHub Actions 生成的 `Codex-LAN-Console-iOS-v1.5.0-simulator-unsigned.zip`
+- iOS 自行签名源码：`Codex-LAN-Console-iOS-v1.5.0-source.zip`（推荐在 Mac 上解压后按 `ios/README.md` 用自己的 Team 构建）
 - 本地端口：TCP 8787
 - 配对数据、通知事件和上传文件：`%LOCALAPPDATA%\CodexLanConsole`
 - 安卓要求：Android 8.0 或更高版本
