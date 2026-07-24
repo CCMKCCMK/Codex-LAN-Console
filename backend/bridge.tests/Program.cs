@@ -369,4 +369,112 @@ finally
     try { if (Directory.Exists(settingsDirectory)) Directory.Delete(settingsDirectory, true); } catch { }
 }
 
+var now = DateTimeOffset.UtcNow;
+var runtimeStates = new ThreadRuntimeStateStore();
+runtimeStates.BeginGeneration();
+
+runtimeStates.ObserveHistoricalStatus(
+    "indexed-active",
+    JsonSerializer.SerializeToElement(new { type = "active" }),
+    now);
+var indexedActive = runtimeStates.Get("indexed-active");
+Assert(
+    indexedActive is { Phase: "unknown", IsRunning: null, Source: "history", CanControl: true },
+    "A persisted active bit must not be promoted to a live bridge-owned turn.");
+Assert(
+    !runtimeStates.IsExternallyOwnedActive("indexed-active"),
+    "A thread-list entry alone must not block a new instruction as externally owned.");
+
+runtimeStates.ObserveRolloutLifecycle(
+    "orphaned-rollout",
+    "task_started",
+    "turn-orphaned",
+    now - TimeSpan.FromHours(1));
+var staleRollout = runtimeStates.Get("orphaned-rollout");
+Assert(
+    staleRollout is { Phase: "unknown", IsRunning: null, Source: "rollout", CanControl: true, Stale: true },
+    "An inactive bare-running rollout must expire instead of blocking the thread for 24 hours.");
+Assert(
+    !runtimeStates.IsExternallyOwnedActive("orphaned-rollout"),
+    "An expired rollout must not cause an external active conflict.");
+
+runtimeStates.ObserveRolloutActivity("orphaned-rollout", now - TimeSpan.FromMinutes(1));
+var refreshedRollout = runtimeStates.Get("orphaned-rollout");
+Assert(
+    refreshedRollout is { Phase: "running", IsRunning: true, Source: "rollout", CanControl: false, Stale: false },
+    "Recent rollout file activity must keep a genuinely active desktop turn live.");
+Assert(
+    refreshedRollout is not null && refreshedRollout.ObservedAt >= now - TimeSpan.FromMinutes(1) &&
+    refreshedRollout.FreshUntil > now,
+    "The mobile snapshot must expose effective rollout freshness instead of the old lifecycle time.");
+
+runtimeStates.ObservePersistedTurn(
+    "orphaned-rollout",
+    "turn-orphaned",
+    "interrupted",
+    completedAt: now - TimeSpan.FromMinutes(2),
+    observedAt: now);
+var interruptedTurn = runtimeStates.Get("orphaned-rollout");
+Assert(
+    interruptedTurn is
+    {
+        Phase: "idle", IsRunning: false, ActiveTurnId: null, LastOutcome: "interrupted",
+        Source: "history", CanControl: true, Stale: false
+    },
+    "The latest terminal persisted turn must override a fresh orphaned rollout for the same turn.");
+Assert(
+    !runtimeStates.IsExternallyOwnedActive("orphaned-rollout"),
+    "A persisted interrupted turn must immediately release the external ownership guard.");
+
+var persistedResponse = JsonSerializer.SerializeToElement(new
+{
+    data = new[]
+    {
+        new
+        {
+            id = "turn-failed",
+            status = "failed",
+            completedAt = now.ToUnixTimeSeconds()
+        }
+    }
+});
+runtimeStates.ObserveRolloutLifecycle("persisted-terminal", "task_started", "turn-failed", now);
+runtimeStates.ObserveLatestPersistedTurn("persisted-terminal", persistedResponse, now);
+var failedTurn = runtimeStates.Get("persisted-terminal");
+Assert(
+    failedTurn is { Phase: "error", IsRunning: false, LastOutcome: "failed", CanControl: true },
+    "Latest-turn reconciliation must recognize a terminal response returned by thread/turns/list.");
+
+runtimeStates.ObserveRolloutLifecycle("missing-completion-time", "task_started", "turn-new", now);
+runtimeStates.ObservePersistedTurn(
+    "missing-completion-time",
+    "turn-old",
+    "completed",
+    completedAt: null,
+    observedAt: now + TimeSpan.FromMinutes(1));
+Assert(
+    runtimeStates.Get("missing-completion-time") is
+    { Phase: "running", IsRunning: true, ActiveTurnId: "turn-new", CanControl: false },
+    "A terminal turn without completedAt must not use fetch time to override a different live turn.");
+
+runtimeStates.ObserveRolloutLifecycle("same-turn-missing-time", "task_started", "turn-same", now);
+runtimeStates.ObservePersistedTurn(
+    "same-turn-missing-time",
+    "turn-same",
+    "interrupted",
+    completedAt: null,
+    observedAt: now + TimeSpan.FromMinutes(1));
+Assert(
+    runtimeStates.Get("same-turn-missing-time") is
+    { Phase: "idle", IsRunning: false, LastOutcome: "interrupted", CanControl: true },
+    "A terminal result without completedAt must still end the same live turn.");
+
+runtimeStates.ObserveHistoricalStatus(
+    "persisted-terminal",
+    JsonSerializer.SerializeToElement(new { type = "active" }),
+    now + TimeSpan.FromMinutes(1));
+Assert(
+    runtimeStates.Get("persisted-terminal") is { Phase: "unknown", IsRunning: null, Source: "history" },
+    "A newer persisted active bit must replace an older terminal result with unknown, not completed.");
+
 Console.WriteLine($"Bridge protocol tests passed: {assertions} assertions.");

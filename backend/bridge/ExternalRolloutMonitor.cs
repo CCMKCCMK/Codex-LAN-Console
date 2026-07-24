@@ -157,7 +157,9 @@ public sealed class ExternalRolloutMonitor : BackgroundService
             return;
         }
         if (!state.IsDesktopOwned) return;
+        var previousOffset = state.Offset;
         var batch = await ReadTailAsync(path, state, null, cancellationToken);
+        if (state.Offset > previousOffset) state.LastActivityAt = SafeLastWriteTime(path) ?? state.LastActivityAt;
         PublishUnresolved(state.ThreadId, batch);
         PublishRuntime(state);
         if (batch.HasUnreadBytes) _signals.Writer.TryWrite(path);
@@ -183,6 +185,7 @@ public sealed class ExternalRolloutMonitor : BackgroundService
         }
         var start = baseline || length > TailBytes ? Math.Max(0, length - TailBytes) : 0;
         var state = new FileTailState(threadId, start, start > 0, true);
+        state.LastActivityAt = SafeLastWriteTime(path);
         _states[path] = state;
         if (baseline && start > 0)
             await SeedLatestLifecycleAsync(path, state, length, cancellationToken);
@@ -452,6 +455,8 @@ public sealed class ExternalRolloutMonitor : BackgroundService
                 state.ActiveTurnId,
                 state.UnresolvedCalls.Count > 0,
                 state.RuntimeObservedAt);
+        if (state.LastActivityAt is { } activityAt)
+            _runtimeStates.ObserveRolloutActivity(state.ThreadId, activityAt);
     }
 
     private IReadOnlyList<FileInfo> FindRecentFiles()
@@ -589,6 +594,12 @@ public sealed class ExternalRolloutMonitor : BackgroundService
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FileNotFoundException) { return -1; }
     }
 
+    private static DateTimeOffset? SafeLastWriteTime(string path)
+    {
+        try { return new DateTimeOffset(File.GetLastWriteTimeUtc(path), TimeSpan.Zero); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FileNotFoundException) { return null; }
+    }
+
     private static bool StringPropertyEquals(JsonElement element, string name, string expected) =>
         element.TryGetProperty(name, out var value) &&
         value.ValueKind == JsonValueKind.String &&
@@ -622,6 +633,7 @@ public sealed class ExternalRolloutMonitor : BackgroundService
         public bool DiscardUntilNewline { get; set; }
         public ArrayBufferWriter<byte> PartialLine { get; } = new();
         public DateTimeOffset LastTouched { get; set; } = DateTimeOffset.UtcNow;
+        public DateTimeOffset? LastActivityAt { get; set; }
         public Dictionary<string, DateTimeOffset?> UnresolvedCalls { get; } = new(StringComparer.Ordinal);
         public Queue<string> CallOrder { get; } = new();
         public string? LifecycleType { get; private set; }

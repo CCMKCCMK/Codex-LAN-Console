@@ -377,13 +377,15 @@ public sealed class CodexAppServer : BackgroundService
     public void ObserveThreadList(JsonElement result)
     {
         if (!result.TryGetProperty("data", out var threads) || threads.ValueKind != JsonValueKind.Array) return;
-        var generation = Volatile.Read(ref _generation);
         foreach (var thread in threads.EnumerateArray())
         {
             if (!TryGetString(thread, "id", out var threadId) || !thread.TryGetProperty("status", out var status)) continue;
             if (TryGetString(thread, "cwd", out var cwd))
                 _threadWorkingDirectories[threadId] = cwd;
-            _runtimeStates.ObserveAppServerStatus(threadId, status, generation);
+            // thread/list is backed by persisted state. Its active bit can be
+            // orphaned after another client exits, so it must not establish
+            // bridge ownership or refresh a live-state lease.
+            _runtimeStates.ObserveHistoricalStatus(threadId, status, UnixTimestamp(thread, "updatedAt"));
         }
     }
 
@@ -472,6 +474,7 @@ public sealed class CodexAppServer : BackgroundService
             sortDirection = "desc",
             itemsView = "notLoaded"
         }, cancellationToken);
+        _runtimeStates.ObserveLatestPersistedTurn(threadId, result);
         if (!result.TryGetProperty("data", out var turns) || turns.ValueKind != JsonValueKind.Array) return null;
         foreach (var turn in turns.EnumerateArray())
             if (TryGetString(turn, "id", out var turnId) && TryGetString(turn, "status", out var status) &&

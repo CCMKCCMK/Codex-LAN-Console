@@ -862,56 +862,51 @@ async function loadOlder() {
   }
 }
 
-function pendingPhase(threadId) {
+function pendingRuntimeState(threadId) {
   const requests = pendingRequests.filter(request => String(request.params?.threadId || '') === threadId);
-  if (!requests.length) return '';
+  if (!requests.length) return null;
   const input = requests.some(isInputPendingRequest);
   const approval = requests.some(request => isResolvableApprovalRequest(request) || isToolApprovalElicitation(request));
-  if (input && approval) return 'waitingAction';
-  if (input) return 'waitingInput';
-  return 'waitingApproval';
+  const phase = input && approval ? 'waitingAction' : input ? 'waitingInput' : 'waitingApproval';
+  const latest = requests.reduce((selected, request) => {
+    const selectedAt = CodexThreadStatus.timestampMs(selected?.createdAt);
+    const requestAt = CodexThreadStatus.timestampMs(request?.createdAt);
+    return !selected || Number.isFinite(requestAt) && (!Number.isFinite(selectedAt) || requestAt > selectedAt)
+      ? request
+      : selected;
+  }, null);
+  return { phase, observedAt: latest?.createdAt || null };
 }
 
 function normalizedRuntimeState(thread) {
   const id = String(thread?.id || '');
   const live = runtimeStates[id] || null;
-  const pending = pendingPhase(id);
-  if (pending) return { ...(live || {}), phase: pending, isRunning: true, canControl: live?.canControl !== false };
-  if (live) return live;
-  const status = thread?.status;
-  const type = typeof status === 'string' ? status : status?.type;
-  const flags = Array.isArray(status?.activeFlags) ? status.activeFlags : [];
-  if (type === 'active') {
-    const phase = flags.includes('waitingOnUserInput')
-      ? (flags.includes('waitingOnApproval') ? 'waitingAction' : 'waitingInput')
-      : flags.includes('waitingOnApproval') ? 'waitingApproval' : 'running';
-    return { phase, isRunning: true, canControl: true, activeFlags: flags };
-  }
-  if (type === 'idle') return { phase: 'idle', isRunning: false, canControl: true };
-  if (type === 'systemError') return { phase: 'error', isRunning: false, canControl: true };
-  return { phase: 'unknown', isRunning: null, canControl: false, source: 'history' };
+  return CodexThreadStatus.normalizeThreadRuntime({
+    thread,
+    runtime: live,
+    pending: pendingRuntimeState(id)
+  });
 }
 
 function statusLabel(status) {
-  const phase = status?.phase || (typeof status === 'string' ? status : status?.type);
-  if (phase === 'idle' && status?.lastOutcome === 'completed') return '已完成';
-  if (phase === 'idle' && status?.lastOutcome === 'interrupted') return '已停止';
-  if (phase === 'idle' && status?.lastOutcome === 'failed') return '上次失败';
-  if (phase === 'running' && status?.source === 'rollout') return '运行中（其他 Codex 进程）';
-  return ({
-    waitingInput: '等待你的回答', waitingApproval: '等待你的批准', waitingAction: '等待你的操作',
-    running: '正在运行', idle: '空闲', error: '运行出错', unavailable: '连接中断',
-    notLoaded: '状态不可见', unknown: '状态不可见', inProgress: '正在运行', active: '正在运行',
-    completed: '已完成', interrupted: '已停止', failed: '失败', systemError: '系统错误'
-  })[phase] || '状态未知';
+  return CodexThreadStatus.statusLabel(status);
 }
 
 function statusTitle(status) {
-  if (status?.stale) return '运行记录已过期，暂时无法确认当前状态';
-  if (status?.source === 'rollout' && status?.isRunning === true) return '根据 Codex 的实时任务记录判断；当前轮次正在运行';
-  if (status?.source === 'rollout') return '根据 Codex 的任务记录判断；当前轮次已经结束';
-  if (status?.source === 'history' || status?.phase === 'unknown') return '该任务未接入当前桥接进程，无法可靠判断是否正在运行';
-  return statusLabel(status);
+  const base = CodexThreadStatus.statusTitle(status);
+  const observedAt = CodexThreadStatus.timestampMs(status?.observedAt);
+  return Number.isFinite(observedAt) ? `${base}；状态记录更新于 ${new Date(observedAt).toLocaleString()}` : base;
+}
+
+function statusMeta(status, thread) {
+  const source = CodexThreadStatus.statusSourceLabel(status);
+  const observedAt = CodexThreadStatus.timestampMs(status?.observedAt);
+  if (Number.isFinite(observedAt)) {
+    const prefix = status?.stale ? '记录更新' : '状态更新';
+    return `${prefix}：${new Date(observedAt).toLocaleString()} · ${source}`;
+  }
+  if (thread?.updatedAt) return `任务更新：${when(thread.updatedAt)} · ${source}`;
+  return source;
 }
 
 function threadCard(thread) {
@@ -920,7 +915,7 @@ function threadCard(thread) {
   const runtime = normalizedRuntimeState(thread);
   return `<article class="card task-card" onclick="openThread('${esc(thread.id)}')">
     <div class="cardTop"><div><h3 title="${esc(title)}">${esc(title)}</h3><p title="${esc(cwd)}">${esc(cwd)}</p></div>
-    <span class="badge" title="${esc(statusTitle(runtime))}">${esc(statusLabel(runtime))}</span></div><p class="task-time">${when(thread.updatedAt)}</p></article>`;
+    <span class="badge" title="${esc(statusTitle(runtime))}">${esc(statusLabel(runtime))}</span></div><p class="task-time" title="${esc(statusTitle(runtime))}">${esc(statusMeta(runtime, thread))}</p></article>`;
 }
 
 function projectCard(project) {
@@ -1644,6 +1639,7 @@ async function loadApprovalSettings() {
 
 async function load() {
   if (summaryLoadPromise) return summaryLoadPromise;
+  const summaryStartedAt = Date.now();
   const request = (async () => {
     try {
       const summary = await api('/summary');
@@ -1652,7 +1648,12 @@ async function load() {
       $('#state').textContent = summary.codexReady ? 'Codex 已连接 · 局域网模式' : '桥接在线，Codex 正在启动';
       $('#dot').classList.toggle('online', summary.codexReady);
       const threads = summary.threads?.data || summary.threads?.threads || [];
-      runtimeStates = summary.runtimeStates || {};
+      runtimeStates = CodexThreadStatus.mergeRuntimeStates(
+        runtimeStates,
+        summary.runtimeStates || {},
+        lastThreadRefreshAt,
+        summaryStartedAt
+      );
       const nextPending = summary.pending || [];
       const nextSignature = nextPending.map(request => `${request.key}:${request.createdAt}`).join('|');
       pendingRequests = nextPending;
@@ -1862,18 +1863,22 @@ $('#pairForm').onsubmit = async event => {
 
 function updateComposerState() {
   const running = currentRuntimeState?.isRunning === true || Boolean(currentActiveTurnId);
+  const unknown = currentRuntimeState?.isRunning !== true && currentRuntimeState?.isRunning !== false;
   const controllable = currentRuntimeState?.canControl !== false;
   const phase = currentRuntimeState?.phase || '';
   $('#interruptTurn').classList.toggle('hidden', !currentActiveTurnId || !controllable);
-  $('#sendMode').textContent = !running
-    ? '发送新的指令'
-    : !controllable
-      ? '当前轮次正在运行；结束后即可续接'
-      : phase === 'waitingInput'
-        ? '任务正在等待你的回答'
-        : phase === 'waitingApproval'
-          ? '任务正在等待批准'
-          : '当前任务运行中，将作为补充指令发送';
+  $('#sendMode').textContent = unknown
+    ? '当前状态不可见；发送时会由电脑端重新确认'
+    : !running
+      ? '发送新的指令'
+      : !controllable
+        ? '当前轮次正在运行；结束后即可续接'
+        : phase === 'waitingInput'
+          ? '任务正在等待你的回答'
+          : phase === 'waitingApproval'
+            ? '任务正在等待批准'
+            : '当前任务运行中，将作为补充指令发送';
+  $('#sendMode').title = statusTitle(currentRuntimeState);
   if (!sending) $('#sendMessage').textContent = running && controllable ? '追加' : '发送';
   updatePermissionHint();
 }
@@ -2550,8 +2555,11 @@ async function refreshCurrentThread(background = false) {
   currentTurns = nextTurns;
   currentTurnCursor = result.nextCursor || '';
   hasEarlierTurns = Boolean(result.hasEarlier);
-  currentRuntimeState = result.runtimeState || runtimeStates[threadId] || normalizedRuntimeState(thread);
-  if (result.runtimeState) runtimeStates[threadId] = result.runtimeState;
+  if (Object.prototype.hasOwnProperty.call(result, 'runtimeState')) {
+    if (result.runtimeState) runtimeStates[threadId] = result.runtimeState;
+    else delete runtimeStates[threadId];
+  }
+  currentRuntimeState = normalizedRuntimeState(thread);
   currentActiveTurnId = currentRuntimeState?.canControl && currentRuntimeState?.isRunning
     ? (currentRuntimeState.activeTurnId || '')
     : '';

@@ -259,6 +259,7 @@ app.MapGet("/api/threads/{id}", async (
                 itemsView = "summary"
             },
             cancellationToken);
+        runtimeStates.ObserveLatestPersistedTurn(id, turnPage);
         return Results.Ok(ApiHelpers.PagedThread(metadata, turnPage, id, runtimeStates.Get(id)));
     }
     catch (CodexRpcException ex) when (ApiHelpers.IsUnmaterializedThread(ex))

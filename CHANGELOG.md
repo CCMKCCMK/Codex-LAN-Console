@@ -42,6 +42,13 @@ and do not promise a stable public API.
   scope from a form default, constant, enum value, or manually submitted JSON.
 - A newly created mobile task can be opened before its first message without
   surfacing the transient empty-rollout error.
+- Interrupted or abandoned desktop turns no longer remain labelled as running
+  for hours; persisted terminal turns now reconcile stale rollout evidence.
+- Recent rollout file activity keeps genuinely long-running work live, while
+  expired records become an explicit unknown state instead of a false running
+  state or an input-blocking ownership conflict.
+- A late summary response can no longer restore an old running badge after a
+  newer task-detail refresh has cleared or completed that state.
 
 ## 1.5.0 - 2026-07-22
 

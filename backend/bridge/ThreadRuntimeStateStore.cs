@@ -14,7 +14,10 @@ public sealed record ThreadRuntimeSnapshot(
     bool CanControl,
     DateTimeOffset ObservedAt,
     long Generation,
-    bool Stale);
+    bool Stale)
+{
+    public DateTimeOffset? FreshUntil { get; init; }
+}
 
 /// <summary>
 /// Keeps live task state separate from persisted thread history. The bridge
@@ -23,9 +26,14 @@ public sealed record ThreadRuntimeSnapshot(
 /// </summary>
 public sealed class ThreadRuntimeStateStore
 {
-    private static readonly TimeSpan ExternalActiveLifetime = TimeSpan.FromHours(24);
+    // A task_started record is not a lease. If its rollout stops changing, the
+    // owning desktop process may have exited without writing task_complete.
+    private static readonly TimeSpan ExternalRunningLifetime = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan ExternalWaitingLifetime = TimeSpan.FromHours(2);
     private readonly ConcurrentDictionary<string, RuntimeEvidence> _appServer = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, RuntimeEvidence> _rollout = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _rolloutActivity = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, RuntimeEvidence> _history = new(StringComparer.Ordinal);
     private long _generation;
 
     public long BeginGeneration()
@@ -77,6 +85,39 @@ public sealed class ThreadRuntimeStateStore
             generation));
     }
 
+    /// <summary>
+    /// Records a status read from the persisted thread index. An indexed
+    /// "active" value is not proof that this app-server owns a live turn: it can
+    /// survive a crashed Desktop process indefinitely.
+    /// </summary>
+    public void ObserveHistoricalStatus(string threadId, JsonElement status, DateTimeOffset? observedAt = null)
+    {
+        if (string.IsNullOrWhiteSpace(threadId) || status.ValueKind != JsonValueKind.Object ||
+            !TryText(status, "type", out var type)) return;
+        var at = observedAt ?? DateTimeOffset.UtcNow;
+        var evidence = type switch
+        {
+            "idle" => new RuntimeEvidence("idle", false, null, Array.Empty<string>(), null, at, 0),
+            "systemError" => new RuntimeEvidence("error", false, null, Array.Empty<string>(), "failed", at, 0),
+            "active" or "notLoaded" => new RuntimeEvidence(
+                "unknown", null, null, Array.Empty<string>(), null, at, 0),
+            _ => null
+        };
+        if (evidence is null) return;
+        _history.AddOrUpdate(threadId,
+            evidence,
+            (_, current) =>
+            {
+                // A latest-turn result is stronger than the denormalized thread
+                // status and carries a useful completion outcome. notLoaded is
+                // only a loss of visibility, while a newer indexed active bit
+                // must replace an older terminal result with unknown state.
+                if (type.Equals("notLoaded", StringComparison.Ordinal) &&
+                    current.IsRunning == false && current.ActiveTurnId is not null) return current;
+                return at < current.ObservedAt ? current : evidence;
+            });
+    }
+
     public void ObserveTurnStarted(string threadId, string turnId, long generation, DateTimeOffset? observedAt = null) =>
         UpdateAppServer(threadId, generation, current => new RuntimeEvidence(
             "running", true, turnId, Array.Empty<string>(), current?.LastOutcome,
@@ -99,8 +140,74 @@ public sealed class ThreadRuntimeStateStore
             _ => normalized
         };
         UpdateAppServer(threadId, generation, _ => new RuntimeEvidence(
-            failed ? "error" : "idle", false, null, Array.Empty<string>(), outcome,
+            failed ? "error" : "idle", false, turnId, Array.Empty<string>(), outcome,
             observedAt ?? DateTimeOffset.UtcNow, generation));
+    }
+
+    /// <summary>
+    /// Reconciles best-effort live observations with the authoritative latest
+    /// persisted turn. A terminal latest turn must end an orphaned rollout even
+    /// when Desktop did not append its final lifecycle event.
+    /// </summary>
+    public void ObservePersistedTurn(
+        string threadId,
+        string turnId,
+        string status,
+        DateTimeOffset? completedAt = null,
+        DateTimeOffset? observedAt = null)
+    {
+        if (string.IsNullOrWhiteSpace(threadId) || string.IsNullOrWhiteSpace(turnId) ||
+            string.IsNullOrWhiteSpace(status)) return;
+        var normalized = status.Trim().Replace("_", "", StringComparison.Ordinal)
+            .Replace("-", "", StringComparison.Ordinal).ToLowerInvariant();
+        if (normalized is "inprogress" or "running")
+        {
+            var progressAt = observedAt ?? DateTimeOffset.UtcNow;
+            var progressEvidence = new RuntimeEvidence(
+                "unknown", null, turnId, Array.Empty<string>(), null, progressAt, 0);
+            _history.AddOrUpdate(threadId, progressEvidence, (_, current) =>
+                progressAt >= current.ObservedAt ? progressEvidence : current);
+            return;
+        }
+        if (normalized is not ("completed" or "failed" or "interrupted" or "cancelled" or "canceled")) return;
+
+        var outcome = normalized switch
+        {
+            "cancelled" or "canceled" => "interrupted",
+            _ => normalized
+        };
+        // Fetch time is not event time. Without completedAt, a terminal result
+        // may end only the same turn; it must not outrank a newer live turn.
+        var at = completedAt ?? DateTimeOffset.MinValue;
+        var evidence = new RuntimeEvidence(
+            outcome == "failed" ? "error" : "idle",
+            false,
+            turnId,
+            Array.Empty<string>(),
+            outcome,
+            at,
+            0);
+        EndMatchingRollout(threadId, turnId, outcome, completedAt);
+        _history.AddOrUpdate(threadId, evidence, (_, current) =>
+            current.ActiveTurnId == turnId || completedAt.HasValue && at >= current.ObservedAt
+                ? evidence
+                : current);
+    }
+
+    public void ObserveLatestPersistedTurn(
+        string threadId,
+        JsonElement response,
+        DateTimeOffset? observedAt = null)
+    {
+        if (response.ValueKind != JsonValueKind.Object ||
+            !response.TryGetProperty("data", out var turns) ||
+            turns.ValueKind != JsonValueKind.Array) return;
+        foreach (var turn in turns.EnumerateArray())
+        {
+            if (!TryText(turn, "id", out var turnId) || !TryText(turn, "status", out var status)) return;
+            ObservePersistedTurn(threadId, turnId, status, UnixTimestamp(turn, "completedAt"), observedAt);
+            return;
+        }
     }
 
     public void ObservePending(
@@ -146,6 +253,7 @@ public sealed class ThreadRuntimeStateStore
         DateTimeOffset? observedAt = null)
     {
         var at = observedAt ?? DateTimeOffset.UtcNow;
+        ObserveRolloutActivity(threadId, at);
         _rollout.AddOrUpdate(threadId,
             _ => RolloutEvidence(eventType, turnId, null, at),
             (_, current) => at < current.ObservedAt ? current : RolloutEvidence(eventType, turnId, current, at));
@@ -158,6 +266,7 @@ public sealed class ThreadRuntimeStateStore
         DateTimeOffset? observedAt = null)
     {
         var at = observedAt ?? DateTimeOffset.UtcNow;
+        ObserveRolloutActivity(threadId, at);
         _rollout.AddOrUpdate(threadId,
             _ => waiting
                 ? new RuntimeEvidence("waitingInput", true, turnId, ["waitingOnUserInput"], null, at, 0)
@@ -176,34 +285,73 @@ public sealed class ThreadRuntimeStateStore
             });
     }
 
+    public void ObserveRolloutActivity(string threadId, DateTimeOffset? observedAt = null)
+    {
+        if (string.IsNullOrWhiteSpace(threadId)) return;
+        var at = observedAt ?? DateTimeOffset.UtcNow;
+        _rolloutActivity.AddOrUpdate(threadId, at, (_, current) => at > current ? at : current);
+    }
+
     public ThreadRuntimeSnapshot? Get(string threadId)
     {
         _appServer.TryGetValue(threadId, out var appServer);
+        if (appServer is not null && appServer.Generation != Volatile.Read(ref _generation))
+            appServer = null;
         _rollout.TryGetValue(threadId, out var rollout);
+        _history.TryGetValue(threadId, out var history);
         RuntimeEvidence? selected;
         var source = "appServer";
         var canControl = true;
-        var rolloutIsFreshAndActive = rollout?.IsRunning == true &&
-                                      DateTimeOffset.UtcNow - rollout.ObservedAt <= ExternalActiveLifetime;
+        var rolloutIsFreshAndActive = rollout?.IsRunning == true && IsFreshRollout(threadId, rollout);
         if (rolloutIsFreshAndActive || appServer is null || rollout is not null && rollout.ObservedAt > appServer.ObservedAt)
         {
             selected = rollout;
             source = "rollout";
-            canControl = false;
+            canControl = rollout?.IsRunning != true;
         }
         else selected = appServer;
+
+        if (history?.IsRunning == false &&
+            (selected is null || history.ActiveTurnId == selected.ActiveTurnId || history.ObservedAt >= selected.ObservedAt))
+        {
+            selected = history;
+            source = "history";
+            canControl = true;
+        }
+        else if (history is { IsRunning: null } && selected?.IsRunning != true &&
+                 (selected is null || history.ObservedAt >= selected.ObservedAt))
+        {
+            selected = history;
+            source = "history";
+            canControl = true;
+        }
+        else if (selected is null && history is not null)
+        {
+            selected = history;
+            source = "history";
+            canControl = true;
+        }
         if (selected is null) return null;
 
         var stale = source == "rollout" && selected.IsRunning == true &&
-                    DateTimeOffset.UtcNow - selected.ObservedAt > ExternalActiveLifetime;
+                    !IsFreshRollout(threadId, selected);
+        var snapshotObservedAt = source == "rollout" && selected.IsRunning == true
+            ? RolloutFreshnessAt(threadId, selected)
+            : selected.ObservedAt;
+        var freshUntil = source == "rollout" && selected.IsRunning == true
+            ? RolloutFreshUntil(threadId, selected)
+            : (DateTimeOffset?)null;
         if (stale)
             return new ThreadRuntimeSnapshot(
                 threadId, "unknown", null, null, Array.Empty<string>(), selected.LastOutcome,
-                source, false, selected.ObservedAt, selected.Generation, true);
+                source, true, snapshotObservedAt, selected.Generation, true)
+            { FreshUntil = freshUntil };
         return new ThreadRuntimeSnapshot(
-            threadId, selected.Phase, selected.IsRunning, selected.ActiveTurnId,
+            threadId, selected.Phase, selected.IsRunning,
+            selected.IsRunning == true ? selected.ActiveTurnId : null,
             selected.ActiveFlags, selected.LastOutcome, source, canControl,
-            selected.ObservedAt, selected.Generation, false);
+            snapshotObservedAt, selected.Generation, false)
+        { FreshUntil = freshUntil };
     }
 
     public bool IsExternallyOwnedActive(string threadId) =>
@@ -211,13 +359,53 @@ public sealed class ThreadRuntimeStateStore
 
     public IReadOnlyDictionary<string, ThreadRuntimeSnapshot> Snapshot()
     {
-        var ids = _appServer.Keys.Concat(_rollout.Keys).Distinct(StringComparer.Ordinal);
+        var ids = _appServer.Keys.Concat(_rollout.Keys).Concat(_history.Keys).Distinct(StringComparer.Ordinal);
         return ids.Select(Get)
             .Where(value => value is not null)
             .ToDictionary(value => value!.ThreadId, value => value!, StringComparer.Ordinal);
     }
 
     private bool IsCurrentGeneration(long generation) => generation == Volatile.Read(ref _generation);
+
+    private void EndMatchingRollout(
+        string threadId,
+        string turnId,
+        string outcome,
+        DateTimeOffset? completedAt)
+    {
+        while (_rollout.TryGetValue(threadId, out var current))
+        {
+            if (!string.Equals(current.ActiveTurnId, turnId, StringComparison.Ordinal)) return;
+            var terminal = new RuntimeEvidence(
+                outcome == "failed" ? "error" : "idle",
+                false,
+                turnId,
+                Array.Empty<string>(),
+                outcome,
+                completedAt ?? current.ObservedAt,
+                0);
+            if (_rollout.TryUpdate(threadId, terminal, current)) return;
+        }
+    }
+
+    private DateTimeOffset RolloutFreshnessAt(string threadId, RuntimeEvidence evidence)
+    {
+        var freshnessAt = evidence.ObservedAt;
+        if (_rolloutActivity.TryGetValue(threadId, out var activity) && activity > freshnessAt)
+            freshnessAt = activity;
+        return freshnessAt;
+    }
+
+    private DateTimeOffset RolloutFreshUntil(string threadId, RuntimeEvidence evidence)
+    {
+        var lifetime = evidence.Phase.StartsWith("waiting", StringComparison.Ordinal)
+            ? ExternalWaitingLifetime
+            : ExternalRunningLifetime;
+        return RolloutFreshnessAt(threadId, evidence) + lifetime;
+    }
+
+    private bool IsFreshRollout(string threadId, RuntimeEvidence evidence) =>
+        DateTimeOffset.UtcNow <= RolloutFreshUntil(threadId, evidence);
 
     private void UpdateAppServer(
         string threadId,
@@ -227,6 +415,7 @@ public sealed class ThreadRuntimeStateStore
         if (!IsCurrentGeneration(generation) || string.IsNullOrWhiteSpace(threadId)) return;
         while (true)
         {
+            if (!IsCurrentGeneration(generation)) return;
             _appServer.TryGetValue(threadId, out var current);
             var next = update(current);
             if (next is null) return;
@@ -283,6 +472,14 @@ public sealed class ThreadRuntimeStateStore
         if (!element.TryGetProperty(property, out var item) || item.ValueKind != JsonValueKind.String) return false;
         value = item.GetString() ?? "";
         return value.Length > 0;
+    }
+
+    private static DateTimeOffset? UnixTimestamp(JsonElement element, string property)
+    {
+        if (!element.TryGetProperty(property, out var timestamp) || !timestamp.TryGetInt64(out var seconds) || seconds <= 0)
+            return null;
+        try { return DateTimeOffset.FromUnixTimeSeconds(seconds); }
+        catch (ArgumentOutOfRangeException) { return null; }
     }
 
     private sealed record RuntimeEvidence(

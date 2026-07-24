@@ -11,15 +11,20 @@ public sealed class NotificationMonitor : BackgroundService
 
     private readonly CodexAppServer _codex;
     private readonly NotificationStore _notifications;
+    private readonly ThreadRuntimeStateStore _runtimeStates;
     private readonly Dictionary<string, ThreadObservation> _threads = new(StringComparer.Ordinal);
     private bool _hasBaseline;
     private int _turnListCapability;
     private long _lastSuccessfulScanAt;
 
-    public NotificationMonitor(CodexAppServer codex, NotificationStore notifications)
+    public NotificationMonitor(
+        CodexAppServer codex,
+        NotificationStore notifications,
+        ThreadRuntimeStateStore runtimeStates)
     {
         _codex = codex;
         _notifications = notifications;
+        _runtimeStates = runtimeStates;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -60,6 +65,16 @@ public sealed class NotificationMonitor : BackgroundService
             present.Add(threadId);
             var updatedAt = Integer(thread, "updatedAt");
             var status = ThreadStatus(thread);
+            if (thread.TryGetProperty("status", out var statusElement))
+            {
+                DateTimeOffset? updated = null;
+                if (updatedAt > 0)
+                {
+                    try { updated = DateTimeOffset.FromUnixTimeSeconds(updatedAt); }
+                    catch (ArgumentOutOfRangeException) { }
+                }
+                _runtimeStates.ObserveHistoricalStatus(threadId, statusElement, updated);
+            }
 
             if (!_threads.TryGetValue(threadId, out var observation))
             {
@@ -156,6 +171,7 @@ public sealed class NotificationMonitor : BackgroundService
             }
 
             var latestTurns = LatestTurns(response);
+            _runtimeStates.ObserveLatestPersistedTurn(threadId, response);
             var suppressExistingTerminal = observation.SuppressNextTerminal;
             var statusChangedSinceRead = !observation.Status.Equals(observation.LastReadStatus, StringComparison.Ordinal);
             foreach (var turn in SelectNewTerminalOutcomes(
