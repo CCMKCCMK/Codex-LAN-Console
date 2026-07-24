@@ -138,7 +138,7 @@ public sealed class NotificationStore
             null,
             null,
             "Codex 正在等待回复",
-            "请在电脑端处理后继续。",
+            "这个轮次由另一个 Codex 进程持有；可在手机新建任务继续处理。",
             false,
             createdAt);
 
@@ -321,10 +321,10 @@ public sealed class NotificationStore
     {
         if (CodexAppServer.IsUserInputRequest(request))
             return ("input_required", "Codex 等待你的回复", "需要你提供信息后才能继续。");
-        if (CodexAppServer.IsApprovalRequest(request) ||
+        if (CodexAppServer.IsUserApprovalRequest(request) ||
             request.Method.EndsWith("/requestApproval", StringComparison.Ordinal))
             return ("approval_required", "Codex 等待批准", "需要你确认一项操作。");
-        if (request.Method.Equals("mcpServer/elicitation/request", StringComparison.Ordinal))
+        if (ElicitationProtocol.IsElicitationRequest(request))
             return ("decision_required", "Codex 等待你的决定", "需要你选择后才能继续。");
         return ("action_required", "Codex 等待处理", "任务需要你打开应用继续处理。");
     }

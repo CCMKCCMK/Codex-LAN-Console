@@ -7,6 +7,9 @@ public sealed record ExecutionPermissions(
 {
     public static ExecutionPermissions Default { get; } = new(":workspace", "on-request", "auto_review");
 
+    public bool IsUnrestrictedAutonomy =>
+        Permissions == ":danger-full-access" && ApprovalPolicy == "never";
+
     public static ExecutionPermissions Parse(
         string? permissions,
         string? approvalPolicy,

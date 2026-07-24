@@ -866,7 +866,7 @@ function pendingPhase(threadId) {
   const requests = pendingRequests.filter(request => String(request.params?.threadId || '') === threadId);
   if (!requests.length) return '';
   const input = requests.some(isInputPendingRequest);
-  const approval = requests.some(isResolvableApprovalRequest);
+  const approval = requests.some(request => isResolvableApprovalRequest(request) || isToolApprovalElicitation(request));
   if (input && approval) return 'waitingAction';
   if (input) return 'waitingInput';
   return 'waitingApproval';
@@ -897,7 +897,7 @@ function statusLabel(status) {
   if (phase === 'idle' && status?.lastOutcome === 'completed') return '已完成';
   if (phase === 'idle' && status?.lastOutcome === 'interrupted') return '已停止';
   if (phase === 'idle' && status?.lastOutcome === 'failed') return '上次失败';
-  if (phase === 'running' && status?.source === 'rollout') return '运行中（电脑端）';
+  if (phase === 'running' && status?.source === 'rollout') return '运行中（其他 Codex 进程）';
   return ({
     waitingInput: '等待你的回答', waitingApproval: '等待你的批准', waitingAction: '等待你的操作',
     running: '正在运行', idle: '空闲', error: '运行出错', unavailable: '连接中断',
@@ -907,9 +907,9 @@ function statusLabel(status) {
 }
 
 function statusTitle(status) {
-  if (status?.stale) return '电脑端运行记录已过期，无法确认当前是否仍在运行';
-  if (status?.source === 'rollout' && status?.isRunning === true) return '根据 Codex Desktop 的实时任务记录判断；请在电脑端控制这一轮';
-  if (status?.source === 'rollout') return '根据 Codex Desktop 的任务记录判断；电脑端这一轮已经结束';
+  if (status?.stale) return '运行记录已过期，暂时无法确认当前状态';
+  if (status?.source === 'rollout' && status?.isRunning === true) return '根据 Codex 的实时任务记录判断；当前轮次正在运行';
+  if (status?.source === 'rollout') return '根据 Codex 的任务记录判断；当前轮次已经结束';
   if (status?.source === 'history' || status?.phase === 'unknown') return '该任务未接入当前桥接进程，无法可靠判断是否正在运行';
   return statusLabel(status);
 }
@@ -939,9 +939,13 @@ function isUserInputRequest(request) {
   return String(request?.method || '').toLowerCase().includes('requestuserinput');
 }
 
+function isMcpElicitationRequest(request) {
+  return String(request?.method || '').toLowerCase() === 'mcpserver/elicitation/request';
+}
+
 function isInputPendingRequest(request) {
   const method = String(request?.method || '').toLowerCase();
-  return isUserInputRequest(request) || method === 'mcpserver/elicitation/request';
+  return isUserInputRequest(request) || (method === 'mcpserver/elicitation/request' && !isToolApprovalElicitation(request));
 }
 
 function isResolvableApprovalRequest(request) {
@@ -997,28 +1001,226 @@ function approvalDetails(request) {
 
 function approvalCard(request, instance = 'list') {
   if (isUserInputRequest(request)) return questionCard(request, instance);
-  if (!isResolvableApprovalRequest(request)) return unsupportedPendingCard(request);
+  if (isMcpElicitationRequest(request)) return elicitationCard(request, instance);
+  if (!isResolvableApprovalRequest(request)) return genericPendingCard(request, instance);
   return `<article class="card approval-card" data-approval-key="${esc(request.key)}"><div class="question-heading"><span class="badge">等待批准</span><h3>${esc(approvalTitle(request))}</h3></div>${approvalDetails(request)}
     <div class="actions"><button onclick="approval('${esc(request.key)}','accept')">允许一次</button>
     <button onclick="approval('${esc(request.key)}','acceptForSession')">本次任务允许</button>
     <button class="danger" onclick="approval('${esc(request.key)}','decline')">拒绝</button></div></article>`;
 }
 
-function unsupportedPendingCard(request) {
-  const method = String(request?.method || '');
-  const threadId = String(request?.params?.threadId || '');
-  let message = '这是一种当前手机端尚不能安全处理的请求，请在电脑端继续。';
-  if (/elicitation/i.test(method)) {
-    message = '某个工具正在请求额外信息。当前协议无法在手机上安全展示完整表单，请在电脑端处理。';
-  } else if (/permission/i.test(method)) {
-    message = 'Codex 正在请求一组细粒度权限。为避免错误扩大授权，请在电脑端核对。';
+function elicitationParams(request) {
+  return request?.params && typeof request.params === 'object' ? request.params : request || {};
+}
+
+function elicitationMeta(request) {
+  const params = elicitationParams(request);
+  const meta = params._meta || params.meta || request?._meta || request?.meta;
+  return meta && typeof meta === 'object' && !Array.isArray(meta) ? meta : {};
+}
+
+function isToolApprovalElicitation(request) {
+  const params = elicitationParams(request);
+  const meta = params._meta || request?._meta;
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return false;
+  return meta.codex_approval_kind === 'mcp_tool_call';
+}
+
+function normalizedSchema(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string' || !value.trim()) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
   }
-  const openButton = threadId
-    ? `<button onclick="openThread('${esc(threadId)}')">查看对应任务</button>`
-    : '';
-  return `<article class="card approval-card"><div class="question-heading"><span class="badge">需要处理</span>
-    <h3>Codex 正在等待电脑端操作</h3></div><p>${esc(message)}</p>
-    ${openButton ? `<div class="actions">${openButton}</div>` : ''}</article>`;
+}
+
+function schemaOptions(schema) {
+  const direct = Array.isArray(schema?.enum) ? schema.enum : null;
+  const directNames = Array.isArray(schema?.enumNames) ? schema.enumNames : [];
+  if (direct) return direct.map((value, index) => ({ value, label: directNames[index] ?? String(value) }));
+  const variants = Array.isArray(schema?.oneOf) ? schema.oneOf : Array.isArray(schema?.anyOf) ? schema.anyOf : null;
+  if (!variants || !variants.every(option => option && Object.prototype.hasOwnProperty.call(option, 'const'))) return [];
+  return variants.map(option => ({ value: option.const, label: option.title || String(option.const) }));
+}
+
+function schemaType(schema) {
+  if (typeof schema?.type === 'string') return schema.type;
+  if (Array.isArray(schema?.type)) return schema.type.find(type => type !== 'null') || schema.type[0];
+  if (schema?.properties && typeof schema.properties === 'object') return 'object';
+  const options = schemaOptions(schema);
+  if (options.length) {
+    const valueType = typeof options[0].value;
+    return ['string', 'number', 'boolean'].includes(valueType) ? valueType : '';
+  }
+  return '';
+}
+
+function schemaPath(path) {
+  return esc(JSON.stringify(path));
+}
+
+function optionValue(value) {
+  return esc(JSON.stringify(value));
+}
+
+function inputTypeForSchema(name, schema) {
+  const format = String(schema?.format || '').toLowerCase();
+  if (schema?.writeOnly || schema?.secret || schema?.isSecret || format === 'password' || /(?:password|secret|token|api.?key)/i.test(name)) return 'password';
+  if (format === 'email') return 'email';
+  if (format === 'uri' || format === 'url') return 'url';
+  if (format === 'date') return 'date';
+  if (format === 'date-time') return 'datetime-local';
+  if (format === 'time') return 'time';
+  return 'text';
+}
+
+function jsonDefault(schema, type) {
+  if (Object.prototype.hasOwnProperty.call(schema || {}, 'default')) return JSON.stringify(schema.default, null, 2);
+  if (type === 'array') return '[]';
+  if (type === 'object') return '{}';
+  return '';
+}
+
+function renderSchemaField(name, schemaValue, required, path, instance, depth = 0) {
+  const schema = normalizedSchema(schemaValue);
+  const type = schemaType(schema);
+  const title = schema.title || name || '内容';
+  const description = schema.description || '';
+  const id = `e-${instance}-${path.join('-') || 'root'}`.replace(/[^a-zA-Z0-9_-]/g, '-');
+  const requiredMark = required ? '<span class="required-mark">必填</span>' : '<span class="optional-mark">可选</span>';
+  const legend = `<legend>${esc(title)} ${requiredMark}</legend>${description ? `<p>${esc(description)}</p>` : ''}`;
+
+  if (type === 'object' && schema.properties && depth < 4) {
+    const requiredKeys = new Set(Array.isArray(schema.required) ? schema.required : []);
+    const children = Object.entries(schema.properties).map(([childName, childSchema]) =>
+      renderSchemaField(childName, childSchema, required && requiredKeys.has(childName), [...path, childName], instance, depth + 1)).join('');
+    return `<fieldset class="question-field elicitation-object" data-elicit-object-path="${schemaPath(path)}" data-elicit-object-required="${required}">${legend}${children || `<textarea class="elicitation-json" data-elicit-kind="json" data-elicit-json-type="object" data-elicit-path="${schemaPath(path)}" data-elicit-required="${required}" rows="4" placeholder="请输入 JSON 对象">${esc(jsonDefault(schema, 'object'))}</textarea>`}</fieldset>`;
+  }
+
+  const options = schemaOptions(schema);
+  if (type === 'array' && schema?.items && schemaOptions(schema.items).length) {
+    const itemOptions = schemaOptions(schema.items);
+    const defaults = Array.isArray(schema.default) ? schema.default : [];
+    const minItems = Number.isInteger(Number(schema.minItems)) && Number(schema.minItems) >= 0 ? Number(schema.minItems) : null;
+    const maxItems = Number.isInteger(Number(schema.maxItems)) && Number(schema.maxItems) >= 0 ? Number(schema.maxItems) : null;
+    const constraints = [minItems !== null ? `至少选择 ${minItems} 项` : '', maxItems !== null ? `最多选择 ${maxItems} 项` : ''].filter(Boolean).join('，');
+    const choices = itemOptions.map(option => `<label class="question-option"><input type="checkbox" data-elicit-kind="multi" data-elicit-path="${schemaPath(path)}" data-elicit-required="${required}" data-elicit-min-items="${minItems ?? ''}" data-elicit-max-items="${maxItems ?? ''}" value="${optionValue(option.value)}" ${defaults.some(value => JSON.stringify(value) === JSON.stringify(option.value)) ? 'checked' : ''}><span><b>${esc(option.label)}</b></span></label>`).join('');
+    return `<fieldset class="question-field">${legend}<div class="question-options">${choices}</div>${constraints ? `<small>${esc(constraints)}</small>` : ''}</fieldset>`;
+  }
+
+  if (type === 'array') {
+    const minItems = Number.isInteger(Number(schema.minItems)) && Number(schema.minItems) >= 0 ? Number(schema.minItems) : '';
+    const maxItems = Number.isInteger(Number(schema.maxItems)) && Number(schema.maxItems) >= 0 ? Number(schema.maxItems) : '';
+    return `<fieldset class="question-field elicitation-json-field">${legend}<textarea class="elicitation-json" data-elicit-kind="json" data-elicit-json-type="array" data-elicit-min-items="${minItems}" data-elicit-max-items="${maxItems}" data-elicit-path="${schemaPath(path)}" data-elicit-required="${required}" rows="4" ${required ? 'required' : ''} placeholder="请输入 JSON 数组">${esc(jsonDefault(schema, 'array'))}</textarea><small>使用 JSON 数组格式，例如 ["第一项", "第二项"]。${minItems !== '' ? `至少 ${minItems} 项。` : ''}${maxItems !== '' ? `最多 ${maxItems} 项。` : ''}</small></fieldset>`;
+  }
+
+  if (options.length) {
+    const defaultValue = Object.prototype.hasOwnProperty.call(schema, 'default') ? JSON.stringify(schema.default) : '';
+    const choices = options.map(option => `<option value="${optionValue(option.value)}" ${JSON.stringify(option.value) === defaultValue ? 'selected' : ''}>${esc(option.label)}</option>`).join('');
+    return `<fieldset class="question-field">${legend}<select id="${esc(id)}" data-elicit-kind="enum" data-elicit-path="${schemaPath(path)}" data-elicit-required="${required}" ${required ? 'required' : ''}><option value="">请选择</option>${choices}</select></fieldset>`;
+  }
+
+  if (type === 'boolean') {
+    const checked = schema.default === true ? 'checked' : '';
+    return `<fieldset class="question-field">${legend}<label class="question-option boolean-option"><input id="${esc(id)}" type="checkbox" data-elicit-kind="boolean" data-elicit-path="${schemaPath(path)}" data-elicit-required="${required}" ${checked}><span><b>${esc(schema.checkboxLabel || title)}</b><small>点击切换</small></span></label></fieldset>`;
+  }
+
+  if (type === 'number' || type === 'integer') {
+    const value = schema.default !== null && schema.default !== '' && Number.isFinite(Number(schema.default)) ? String(schema.default) : '';
+    const min = Number.isFinite(Number(schema.minimum)) ? ` min="${esc(schema.minimum)}"` : '';
+    const max = Number.isFinite(Number(schema.maximum)) ? ` max="${esc(schema.maximum)}"` : '';
+    return `<fieldset class="question-field">${legend}<input id="${esc(id)}" type="number" data-elicit-kind="${type}" data-elicit-path="${schemaPath(path)}" data-elicit-required="${required}" value="${esc(value)}" step="${type === 'integer' ? '1' : 'any'}"${min}${max} ${required ? 'required' : ''}></fieldset>`;
+  }
+
+  if (type === 'string' || type === 'secret') {
+    const inputType = type === 'secret' ? 'password' : inputTypeForSchema(name, schema);
+    const value = schema.default == null ? '' : String(schema.default);
+    const min = Number.isFinite(Number(schema.minLength)) ? ` minlength="${esc(schema.minLength)}"` : '';
+    const max = Number.isFinite(Number(schema.maxLength)) ? ` maxlength="${esc(schema.maxLength)}"` : '';
+    const pattern = typeof schema.pattern === 'string' ? ` pattern="${esc(schema.pattern)}"` : '';
+    const common = `data-elicit-kind="string" data-elicit-path="${schemaPath(path)}" data-elicit-required="${required}" ${required ? 'required' : ''}${min}${max}${pattern}`;
+    const control = schema.multiline || Number(schema.maxLength) > 240
+      ? `<textarea id="${esc(id)}" ${common} rows="3">${esc(value)}</textarea>`
+      : `<input id="${esc(id)}" type="${inputType}" ${common} value="${esc(value)}" autocomplete="${inputType === 'password' ? 'off' : 'on'}">`;
+    return `<fieldset class="question-field">${legend}${control}</fieldset>`;
+  }
+
+  const fallback = jsonDefault(schema, type);
+  const expectedType = type === 'object' ? ' data-elicit-json-type="object"' : '';
+  return `<fieldset class="question-field elicitation-json-field">${legend}<textarea class="elicitation-json" data-elicit-kind="json"${expectedType} data-elicit-path="${schemaPath(path)}" data-elicit-required="${required}" rows="4" ${required ? 'required' : ''} placeholder="请输入有效的 JSON">${esc(fallback)}</textarea><small>此字段使用通用 JSON 输入。</small></fieldset>`;
+}
+
+function toolApprovalDetails(request) {
+  const meta = elicitationMeta(request);
+  const params = elicitationParams(request);
+  const rows = Array.isArray(meta.tool_params_display) ? meta.tool_params_display : [];
+  const details = rows.map(row => `<div><dt>${esc(row.display_name || row.name || '参数')}</dt><dd>${esc(row.value ?? '')}</dd></div>`).join('');
+  const risk = String(meta.riskLevel || '').toLowerCase();
+  const riskLabel = risk ? `<span class="elicitation-risk ${risk === 'high' ? 'high' : ''}">${risk === 'high' ? '高风险' : '需要授权'}</span>` : '';
+  return `${riskLabel}<p>${esc(params.message || '工具需要你的允许才能继续。')}</p>${meta.subtitle ? `<p class="question-context">${esc(meta.subtitle)}</p>` : ''}${details ? `<dl class="elicitation-details">${details}</dl>` : ''}`;
+}
+
+function toolApprovalCard(request) {
+  const meta = elicitationMeta(request);
+  const persistence = new Set(Array.isArray(meta.persist) ? meta.persist : typeof meta.persist === 'string' ? [meta.persist] : []);
+  const connector = meta.connector_name || (String(meta.connector_id || '').toLowerCase() === 'computer-use' ? 'Computer Use' : '工具');
+  const session = persistence.has('session') ? `<button type="button" onclick="submitElicitationAction(event,'${esc(request.key)}','accept','session')">本次任务允许</button>` : '';
+  const always = persistence.has('always') ? `<button type="button" onclick="submitElicitationAction(event,'${esc(request.key)}','accept','always')">始终允许</button>` : '';
+  const manualFields = toolApprovalManualFields(request);
+  return `<form class="card approval-card tool-approval-card" data-pending-key="${esc(request.key)}" onsubmit="event.preventDefault()"><div class="question-heading"><span class="badge">工具授权</span><h3>允许 ${esc(connector)} 继续？</h3></div>${toolApprovalDetails(request)}${manualFields ? `<div class="tool-approval-extra"><p>此工具还需要以下内容：</p>${manualFields}</div>` : ''}<div class="actions elicitation-actions"><button type="button" onclick="submitElicitationAction(event,'${esc(request.key)}','accept')">允许一次</button>${session}${always}<button type="button" class="danger" onclick="submitElicitationAction(event,'${esc(request.key)}','decline')">拒绝</button></div></form>`;
+}
+
+function safeElicitationUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return ['http:', 'https:'].includes(url.protocol) ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+function urlElicitationCard(request) {
+  const params = elicitationParams(request);
+  const url = safeElicitationUrl(params.url);
+  const local = url && isLocalDevelopmentUrl(url);
+  const link = url
+    ? `<a class="elicitation-link" href="${esc(url.href)}" ${local ? `data-local-url="${esc(url.href)}"` : ''} ${isNativeShell ? '' : 'target="_blank"'} rel="noopener noreferrer">打开验证页面</a>`
+    : '<p class="elicitation-invalid">请求没有提供可打开的网页地址。</p>';
+  return `<article class="card approval-card url-elicitation-card" data-pending-key="${esc(request.key)}"><div class="question-heading"><span class="badge">网页确认</span><h3>${esc(params.serverName || '工具需要网页操作')}</h3></div><p>${esc(params.message || '请打开页面完成操作，再选择下一步。')}</p>${link}<div class="actions elicitation-actions"><button type="button" onclick="submitElicitationAction(event,'${esc(request.key)}','accept')">已完成，继续</button><button type="button" class="secondary" onclick="submitElicitationAction(event,'${esc(request.key)}','decline')">拒绝</button><button type="button" class="danger" onclick="submitElicitationAction(event,'${esc(request.key)}','cancel')">取消任务</button></div></article>`;
+}
+
+function formElicitationCard(request, instance) {
+  const params = elicitationParams(request);
+  const schema = normalizedSchema(params.requestedSchema || params.schema);
+  const type = schemaType(schema);
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+  let fields = '';
+  if (type === 'object' || schema.properties) {
+    fields = Object.entries(schema.properties || {}).map(([name, field]) =>
+      renderSchemaField(name, field, required.has(name), [name], `${request.key}-${instance}`)).join('');
+  } else if (Object.keys(schema).length) {
+    fields = renderSchemaField('内容', schema, true, [], `${request.key}-${instance}`);
+  }
+  const rawFallback = fields
+    ? '<details class="elicitation-advanced"><summary>高级：直接编辑 JSON</summary><textarea data-elicit-raw rows="5" placeholder="填写后将覆盖上面的字段"></textarea><small>仅在普通字段无法表达请求时使用。</small></details>'
+    : `<div class="elicitation-json-fallback"><p>请填写工具需要的结构化内容。</p><textarea data-elicit-raw rows="6" required placeholder="请输入有效的 JSON">${esc(jsonDefault(schema, type || 'object'))}</textarea></div>`;
+  return `<form class="card question-card elicitation-card" data-pending-key="${esc(request.key)}" onsubmit="submitElicitation(event,'${esc(request.key)}')"><div class="question-heading"><span class="badge">需要填写</span><h3>${esc(params.serverName || '工具请求信息')}</h3></div><p class="question-context">${esc(params.message || '填写后会直接交给正在运行的工具。')}</p>${fields}${rawFallback}<div class="question-submit elicitation-submit"><small>内容只用于完成当前请求。</small><button type="submit">提交并继续</button></div><div class="actions elicitation-secondary-actions"><button type="button" class="secondary" onclick="submitElicitationAction(event,'${esc(request.key)}','decline')">拒绝</button><button type="button" class="danger" onclick="submitElicitationAction(event,'${esc(request.key)}','cancel')">取消</button></div></form>`;
+}
+
+function elicitationCard(request, instance = 'list') {
+  if (isToolApprovalElicitation(request)) return toolApprovalCard(request);
+  const mode = String(elicitationParams(request).mode || 'form').toLowerCase();
+  if (mode === 'url') return urlElicitationCard(request);
+  return formElicitationCard(request, instance);
+}
+
+function genericPendingCard(request, instance = 'list') {
+  const params = elicitationParams(request);
+  const reason = firstText(params, ['message', 'reason', 'description']) || 'Codex 需要一项补充响应才能继续。';
+  return `<form class="card question-card elicitation-card generic-pending-card" data-pending-key="${esc(request.key)}" onsubmit="submitElicitation(event,'${esc(request.key)}')"><div class="question-heading"><span class="badge">需要响应</span><h3>${esc(approvalTitle(request))}</h3></div><p class="question-context">${esc(reason)}</p><label class="question-title" for="generic-${esc(instance)}-${esc(request.key)}">响应内容 <small>可以输入文字，或填写 JSON</small></label><textarea id="generic-${esc(instance)}-${esc(request.key)}" data-elicit-generic rows="3" placeholder="输入回复；留空表示直接继续"></textarea><div class="actions elicitation-actions"><button type="submit">继续</button><button type="button" class="secondary" onclick="submitElicitationAction(event,'${esc(request.key)}','decline')">拒绝</button><button type="button" class="danger" onclick="submitElicitationAction(event,'${esc(request.key)}','cancel')">取消</button></div></form>`;
 }
 
 function questionCard(request, instance = 'list') {
@@ -1049,7 +1251,7 @@ function questionCard(request, instance = 'list') {
   const autoMs = Number(params.autoResolutionMs);
   const deadline = Number.isFinite(autoMs) && autoMs > 0 ? Date.parse(request.createdAt || '') + autoMs : 0;
   const countdown = deadline
-    ? `<small class="pending-countdown" data-deadline="${deadline}">电脑端可能会自动继续</small>`
+    ? `<small class="pending-countdown" data-deadline="${deadline}">Codex 可能会自动继续</small>`
     : '<small>你的回答会直接交给正在运行的 Codex。</small>';
   return `<form class="card question-card" data-pending-key="${esc(request.key)}" onsubmit="submitAnswers(event,'${esc(request.key)}')">
     <div class="question-heading"><span class="badge">需要回答</span><h3>Codex 正在等你选择</h3></div>${fields || '<p>这项请求没有可显示的问题。</p>'}
@@ -1060,8 +1262,8 @@ function updatePendingCountdowns() {
   document.querySelectorAll('.pending-countdown[data-deadline]').forEach(element => {
     const remaining = Math.max(0, Number(element.dataset.deadline) - Date.now());
     element.textContent = remaining > 0
-      ? `约 ${Math.ceil(remaining / 1000)} 秒后电脑端可能自动继续`
-      : '正在等待电脑端同步状态';
+      ? `约 ${Math.ceil(remaining / 1000)} 秒后 Codex 可能自动继续`
+      : '正在同步最新状态';
   });
 }
 
@@ -1115,6 +1317,238 @@ async function submitAnswers(event, key) {
   }
 }
 
+function setPathValue(target, path, value) {
+  if (!path.length) {
+    target.value = value;
+    return;
+  }
+  let cursor = target;
+  path.forEach((segment, index) => {
+    if (index === path.length - 1) cursor[segment] = value;
+    else {
+      if (!cursor[segment] || typeof cursor[segment] !== 'object' || Array.isArray(cursor[segment])) cursor[segment] = {};
+      cursor = cursor[segment];
+    }
+  });
+}
+
+function elicitationPath(control) {
+  try {
+    const path = JSON.parse(control.dataset.elicitPath || '[]');
+    return Array.isArray(path) ? path : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseElicitationValue(control) {
+  const kind = control.dataset.elicitKind;
+  if (kind === 'boolean') return control.checked;
+  if (kind === 'number' || kind === 'integer') {
+    if (control.value === '') return undefined;
+    const value = Number(control.value);
+    if (!Number.isFinite(value) || (kind === 'integer' && !Number.isInteger(value))) throw new Error('请输入有效的数字');
+    return value;
+  }
+  if (kind === 'enum') return control.value === '' ? undefined : JSON.parse(control.value);
+  if (kind === 'json') {
+    const value = control.value.trim();
+    if (!value) return undefined;
+    try {
+      const parsed = JSON.parse(value);
+      if (control.dataset.elicitJsonType === 'array' && !Array.isArray(parsed)) throw new Error('请输入 JSON 数组');
+      if (control.dataset.elicitJsonType === 'object' && (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))) throw new Error('请输入 JSON 对象');
+      if (Array.isArray(parsed)) {
+        const minItems = control.dataset.elicitMinItems === '' ? null : Number(control.dataset.elicitMinItems);
+        const maxItems = control.dataset.elicitMaxItems === '' ? null : Number(control.dataset.elicitMaxItems);
+        if (Number.isInteger(minItems) && parsed.length < minItems) throw new Error(`请至少填写 ${minItems} 项`);
+        if (Number.isInteger(maxItems) && parsed.length > maxItems) throw new Error(`最多只能填写 ${maxItems} 项`);
+      }
+      return parsed;
+    } catch (error) {
+      if (error.message === '请输入 JSON 数组' || error.message === '请输入 JSON 对象' ||
+          error.message.startsWith('请至少填写 ') || error.message.startsWith('最多只能填写 ')) throw error;
+      throw new Error('JSON 内容格式不正确');
+    }
+  }
+  const value = control.value.trim();
+  return value === '' ? undefined : value;
+}
+
+function collectElicitationContent(form) {
+  const raw = form.querySelector('[data-elicit-raw]')?.value.trim();
+  if (raw) {
+    let parsed;
+    try { parsed = JSON.parse(raw); }
+    catch { throw new Error('高级 JSON 内容格式不正确'); }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('表单响应必须是 JSON 对象');
+    return parsed;
+  }
+
+  const generic = form.querySelector('[data-elicit-generic]');
+  if (generic) {
+    const value = generic.value.trim();
+    if (!value) return {};
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : { answer: parsed };
+    } catch {
+      return { answer: value };
+    }
+  }
+
+  const content = {};
+  const multi = new Map();
+  for (const marker of form.querySelectorAll('[data-elicit-object-path][data-elicit-object-required="true"]')) {
+    setPathValue(content, elicitationPath({ dataset: { elicitPath: marker.dataset.elicitObjectPath } }), {});
+  }
+  for (const control of form.querySelectorAll('[data-elicit-kind]')) {
+    const path = elicitationPath(control);
+    const required = control.dataset.elicitRequired === 'true';
+    if (control.dataset.elicitKind === 'multi') {
+      const key = JSON.stringify(path);
+      if (!multi.has(key)) multi.set(key, {
+        path,
+        required,
+        minItems: control.dataset.elicitMinItems === '' ? null : Number(control.dataset.elicitMinItems),
+        maxItems: control.dataset.elicitMaxItems === '' ? null : Number(control.dataset.elicitMaxItems),
+        values: []
+      });
+      if (control.checked) multi.get(key).values.push(JSON.parse(control.value));
+      continue;
+    }
+    const value = parseElicitationValue(control);
+    if (value === undefined) {
+      if (required) {
+        control.focus();
+        throw new Error('请填写所有必填内容');
+      }
+      continue;
+    }
+    setPathValue(content, path, value);
+  }
+  for (const group of multi.values()) {
+    if (Number.isInteger(group.minItems) && group.values.length < group.minItems) throw new Error(`请至少选择 ${group.minItems} 项`);
+    if (Number.isInteger(group.maxItems) && group.values.length > group.maxItems) throw new Error(`最多只能选择 ${group.maxItems} 项`);
+    if (group.values.length || group.required) setPathValue(content, group.path, group.values);
+  }
+  if (Object.prototype.hasOwnProperty.call(content, 'value') && Object.keys(content).length === 1) return { value: content.value };
+  return content;
+}
+
+function approvalValueScore(value, persistence) {
+  const normalized = String(value ?? '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+  const target = persistence === 'always' ? 'always' : persistence === 'session' ? 'session' : 'once';
+  let score = normalized.includes(target) ? 100 : 0;
+  if (/allow|approve|accept|yes|continue|proceed/.test(normalized)) score += 50;
+  if (/deny|decline|reject|cancel|no/.test(normalized)) score -= 200;
+  return score;
+}
+
+function approvalValuePersistence(value) {
+  const normalized = String(value ?? '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+  if (/always|permanent|forever|persist|remember|device/.test(normalized)) return 'always';
+  if (/session|task/.test(normalized)) return 'session';
+  if (/once|turn|onetime/.test(normalized)) return 'once';
+  return null;
+}
+
+function isCompatibleApprovalValue(value, persistence) {
+  if (typeof value !== 'string') return true;
+  const scope = approvalValuePersistence(value);
+  if (!persistence) return scope === null || scope === 'once';
+  if (persistence === 'session') return scope === null || scope === 'once' || scope === 'session';
+  return persistence === 'always';
+}
+
+function inferredToolApprovalValue(name, propertyValue, persistence) {
+  const property = normalizedSchema(propertyValue);
+  if (Object.prototype.hasOwnProperty.call(property, 'const')) return isCompatibleApprovalValue(property.const, persistence) ? property.const : undefined;
+  if (Object.prototype.hasOwnProperty.call(property, 'default')) return isCompatibleApprovalValue(property.default, persistence) ? property.default : undefined;
+  if (schemaType(property) === 'boolean' && /approve|allow|confirm|consent|permission/i.test(name)) return true;
+  const options = schemaOptions(property).filter(option => isCompatibleApprovalValue(option.value, persistence));
+  if (options.length) {
+    const ranked = [...options].sort((left, right) => approvalValueScore(right.value, persistence) - approvalValueScore(left.value, persistence));
+    if (approvalValueScore(ranked[0].value, persistence) > 0) return ranked[0].value;
+  }
+  return undefined;
+}
+
+function toolApprovalManualFields(request) {
+  const schema = normalizedSchema(elicitationParams(request).requestedSchema || elicitationParams(request).schema);
+  const properties = schema.properties && typeof schema.properties === 'object' ? schema.properties : {};
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+  return Object.entries(properties)
+    .filter(([name, property]) => required.has(name) && inferredToolApprovalValue(name, property, null) === undefined)
+    .map(([name, property]) => renderSchemaField(name, property, true, [name], `${request.key}-approval`))
+    .join('');
+}
+
+function toolApprovalContent(request, persistence, provided = {}) {
+  const schema = normalizedSchema(elicitationParams(request).requestedSchema || elicitationParams(request).schema);
+  const properties = schema.properties && typeof schema.properties === 'object' ? schema.properties : {};
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+  const content = { ...provided };
+  for (const [name, propertyValue] of Object.entries(properties)) {
+    const relevant = required.has(name) || /approve|allow|confirm|consent|scope|decision|permission/i.test(name);
+    if (!relevant) continue;
+    if (Object.prototype.hasOwnProperty.call(content, name) && !isCompatibleApprovalValue(content[name], persistence))
+      throw new Error(`${name} 超出了所选授权时限`);
+    const value = inferredToolApprovalValue(name, propertyValue, persistence);
+    if (value === undefined && required.has(name) && !Object.prototype.hasOwnProperty.call(content, name)) throw new Error(`授权表单仍需要填写：${name}`);
+    if (value !== undefined) content[name] = value;
+  }
+  return content;
+}
+
+function setElicitationBusy(container, busy) {
+  container?.querySelectorAll('button,input,select,textarea').forEach(control => { control.disabled = busy; });
+  container?.setAttribute('aria-busy', String(busy));
+}
+
+async function sendElicitation(key, action, content, persistence, container) {
+  setElicitationBusy(container, true);
+  try {
+    await api(`/pending/${encodeURIComponent(key)}/elicitation`, {
+      method: 'POST', body: { action, content: action === 'accept' ? content : null, persistence: persistence || null }
+    });
+    toast(action === 'accept' ? '已提交，Codex 将继续运行' : action === 'decline' ? '已拒绝这项请求' : '已取消这项请求');
+    await load();
+    if (currentThread) await refreshCurrentThread(true);
+  } catch (error) {
+    toast(error.status === 404 ? '这项请求已在其他设备处理' : error.message);
+    if (error.status === 404) await load();
+    else setElicitationBusy(container, false);
+  }
+}
+
+async function submitElicitation(event, key) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!form.reportValidity()) return;
+  try {
+    await sendElicitation(key, 'accept', collectElicitationContent(form), null, form);
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function submitElicitationAction(event, key, action, persistence = null) {
+  event.preventDefault();
+  const container = event.currentTarget.closest('[data-pending-key]');
+  let content = {};
+  if (action === 'accept') {
+    const request = pendingRequests.find(item => item.key === key);
+    if (request && String(elicitationParams(request).mode || '').toLowerCase() === 'url') content = null;
+    else if (request && isToolApprovalElicitation(request)) {
+      if (container?.matches('form') && !container.reportValidity()) return;
+      try { content = toolApprovalContent(request, persistence, container?.matches('form') ? collectElicitationContent(container) : {}); }
+      catch (error) { toast(error.message); return; }
+    }
+  }
+  await sendElicitation(key, action, content, persistence, container);
+}
+
 function mergedProjects(scanned, threads) {
   const map = new Map();
   for (const project of scanned || []) map.set(String(project.path).toLowerCase(), project);
@@ -1136,19 +1570,25 @@ function renderDetailPending() {
     return;
   }
   const requests = pendingRequests.filter(request => String(request.params?.threadId || '') === currentThread);
-  $('#detailPending').innerHTML = requests.map((request, index) => approvalCard(request, `detail-${index}`)).join('');
+  const root = $('#detailPending');
+  root.innerHTML = requests.map((request, index) => approvalCard(request, `detail-${index}`)).join('');
+  prepareLocalResources(root).catch(() => { /* The link can be retried by tapping it. */ });
 }
 
 function renderPendingLists() {
-  $('#recentApprovals').innerHTML = pendingRequests.map((request, index) => approvalCard(request, `recent-${index}`)).join('') || empty('暂无待处理事项');
-  $('#approvalList').innerHTML = pendingRequests.map((request, index) => approvalCard(request, `all-${index}`)).join('') || empty('暂无待处理事项');
+  const recent = $('#recentApprovals');
+  const all = $('#approvalList');
+  recent.innerHTML = pendingRequests.map((request, index) => approvalCard(request, `recent-${index}`)).join('') || empty('暂无待处理事项');
+  all.innerHTML = pendingRequests.map((request, index) => approvalCard(request, `all-${index}`)).join('') || empty('暂无待处理事项');
+  prepareLocalResources(recent).catch(() => { /* The link can be retried by tapping it. */ });
+  prepareLocalResources(all).catch(() => { /* The link can be retried by tapping it. */ });
   renderDetailPending();
   renderApprovalControls();
   updatePendingCountdowns();
 }
 
 function supportedPendingApprovals() {
-  return pendingRequests.filter(isResolvableApprovalRequest);
+  return pendingRequests.filter(request => isResolvableApprovalRequest(request) || isToolApprovalElicitation(request));
 }
 
 function renderApprovalControls() {
@@ -1179,7 +1619,7 @@ function renderApprovalControls() {
   }
   if (description) {
     description.textContent = !supported
-      ? '当前电脑端版本不支持自动批准，请先更新电脑端。'
+      ? '当前桥接服务版本不支持自动批准；更新服务后即可使用。'
       : enabled
         ? '已开启：电脑端桥接服务会自动允许 Console 管理的新审批。需要回答的问题和表单仍会停下来。'
         : '开启后，电脑端桥接服务会对 Console 管理的新审批自动选择允许。需要你回答的问题仍会停下来。';
@@ -1428,7 +1868,7 @@ function updateComposerState() {
   $('#sendMode').textContent = !running
     ? '发送新的指令'
     : !controllable
-      ? '电脑端正在运行；本轮结束后再发送'
+      ? '当前轮次正在运行；结束后即可续接'
       : phase === 'waitingInput'
         ? '任务正在等待你的回答'
         : phase === 'waitingApproval'
@@ -1760,24 +2200,39 @@ function toggleSkill(path) {
   saveDraft();
 }
 
-const executionSettingsKey = 'codexExecutionSettings';
+const executionSettingsKey = 'codexExecutionSettingsV2';
+const legacyExecutionSettingsKey = 'codexExecutionSettings';
+const defaultExecutionSettings = Object.freeze({ permissions: ':danger-full-access', approvalMode: 'never' });
 const dangerAcknowledgedKey = 'codexDangerPermissionAcknowledgedV2';
 const unrestrictedAcknowledgedKey = 'codexUnrestrictedAutonomyAcknowledgedV1';
 const autoApproveAcknowledgedKey = 'codexAutoApproveAllAcknowledgedV1';
 
 function executionSettings() {
-  const mode = $('#approvalMode').value;
+  const mode = $('#approvalMode').value || defaultExecutionSettings.approvalMode;
   const approval = ({
     auto: { approvalPolicy: 'on-request', approvalsReviewer: 'auto_review' },
     ask: { approvalPolicy: 'on-request', approvalsReviewer: 'user' },
     never: { approvalPolicy: 'never', approvalsReviewer: 'user' },
     strict: { approvalPolicy: 'untrusted', approvalsReviewer: 'user' }
-  })[mode] || { approvalPolicy: 'on-request', approvalsReviewer: 'auto_review' };
-  return { permissions: $('#runtimePermission').value || ':workspace', ...approval };
+  })[mode] || { approvalPolicy: 'never', approvalsReviewer: 'user' };
+  return { permissions: $('#runtimePermission').value || defaultExecutionSettings.permissions, ...approval };
 }
 
 function storedExecutionSettings() {
-  try { return JSON.parse(localStorage.getItem(executionSettingsKey) || '{}'); } catch { return {}; }
+  try {
+    const stored = JSON.parse(localStorage.getItem(executionSettingsKey) || 'null');
+    if (stored && typeof stored === 'object') return { ...defaultExecutionSettings, ...stored };
+    const legacy = JSON.parse(localStorage.getItem(legacyExecutionSettingsKey) || 'null');
+    // Preserve an existing unrestricted choice. Older conservative defaults are
+    // intentionally upgraded once because V2 makes phone-owned tasks autonomous.
+    const migrated = legacy?.permissions === ':danger-full-access' && legacy?.approvalMode === 'never'
+      ? { permissions: legacy.permissions, approvalMode: legacy.approvalMode }
+      : { ...defaultExecutionSettings };
+    localStorage.setItem(executionSettingsKey, JSON.stringify(migrated));
+    return migrated;
+  } catch {
+    return { ...defaultExecutionSettings };
+  }
 }
 
 function applyExecutionSettings(settings = {}) {
@@ -1844,7 +2299,7 @@ function updatePermissionHint() {
   });
   const nextTurn = currentRuntimeState?.isRunning === true ? ' 当前轮不会中途换权，新设置从下一轮生效。' : '';
   const ownership = permission === ':danger-full-access' && mode === 'never'
-    ? ' 仅适用于由 Console 发起或续跑的轮次；电脑端已经控制的活动轮次仍需在电脑端处理。'
+    ? ' 由其他 Codex 进程已经发起的活动轮次会保留原有设置；手机续跑时会使用这里的权限。'
     : '';
   let text = permission === ':read-only'
     ? '只读沙箱：Codex 可以查看内容，但不能修改文件。'
@@ -1933,7 +2388,7 @@ async function confirmExecutionSettings() {
   const accepted = await showRiskConfirmation(unrestricted ? {
     title: '启用完全自主运行？',
     message: '这会为由 Console 发起或续跑的轮次同时关闭电脑文件沙箱和逐项审批。Codex 获得与当前 Windows 用户相同的访问范围。',
-    consequences: ['可以读写或删除项目外文件。', '可以运行命令并操作已登录的应用。', '电脑端已经控制的活动轮次不会被接管，仍需在电脑端处理。', '错误指令或恶意网页内容可能直接造成损失。']
+    consequences: ['可以读写或删除项目外文件。', '可以运行命令并操作已登录的应用。', '其他 Codex 进程已经发起的活动轮次会保留原有设置。', '错误指令或恶意网页内容可能直接造成损失。']
   } : {
     title: '允许访问整台电脑？',
     message: '这会为由 Console 发起或续跑的轮次关闭文件沙箱，但仍保留你选择的审批策略。',
@@ -2224,7 +2679,7 @@ async function handleExecutionSelectionChange() {
   const previous = storedExecutionSettings();
   updatePermissionHint();
   if (!(await confirmExecutionSettings())) {
-    applyExecutionSettings(Object.keys(previous).length ? previous : { permissions: ':workspace', approvalMode: 'auto' });
+    applyExecutionSettings(Object.keys(previous).length ? previous : defaultExecutionSettings);
     return;
   }
   saveExecutionSettings();
@@ -2260,7 +2715,7 @@ $('#composer').onsubmit = async event => {
   event.preventDefault();
   if (sending || !currentThread) return;
   if (currentRuntimeState?.isRunning === true && currentRuntimeState?.canControl === false) {
-    toast('这一轮由电脑端 Codex 控制，请等它结束后再发送');
+    toast('当前轮次正在运行，结束后即可从手机续接');
     return;
   }
   const rawCommand = $('#message').value.trim();
@@ -2406,7 +2861,7 @@ async function setAutoApproveAll(enabled) {
     const accepted = await showRiskConfirmation({
       title: '自动允许所有后续审批？',
       message: '开启后，电脑端桥接服务会对 Console 管理的每一个支持审批自动选择 Yes，不再等你逐项检查。',
-      consequences: ['命令、文件修改和细粒度权限请求都会被自动允许。', '这不是风险审核；桥接服务不会替你判断请求是否安全。', '电脑端其他 app-server 已经控制的轮次不会被接管。', '普通问题和需要你填写的表单仍会等待你的回答。']
+      consequences: ['命令、文件修改和细粒度权限请求都会被自动允许。', '这不是风险审核；桥接服务不会替你判断请求是否安全。', '其他 app-server 已开始的轮次会保持原有执行状态。', '普通问题和需要你填写的表单仍会等待你的回答。']
     });
     if (!accepted) {
       renderApprovalControls();

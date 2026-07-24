@@ -98,10 +98,14 @@ full-history fallback.
 | GET | `/api/approval-settings` | Read persistent auto-approval settings and counters. |
 | POST | `/api/approval-settings` | Enable or disable persistent auto-approval. Enabling requires the exact confirmation phrase. |
 | POST | `/api/pending/{key}/answers` | Answer a structured user-input request. |
+| POST | `/api/pending/{key}/elicitation` | Accept, decline, or cancel an MCP form or URL elicitation with typed content and optional advertised persistence. |
 
 Auto-approval does not invent answers for user questions or arbitrary MCP
-elicitation forms. Approval behavior is security-sensitive and must remain
-consistent with the effective Codex and organization policy.
+elicitation forms. It may accept an MCP request only when that request explicitly
+identifies itself as a tool approval and its required response can be constructed
+from constants, defaults, approval booleans, or approval enums. Approval behavior
+is security-sensitive and must remain consistent with the effective Codex and
+organization policy.
 
 ### Files and local links
 
@@ -141,8 +145,9 @@ does not validate after remapping.
 
 A task actively owned by another desktop Codex process is observable but not
 safe for bridge mutation. Mutating endpoints may reject such a request instead
-of creating competing app-server ownership. Clients must present this state
-honestly and direct the user to the owning desktop process when necessary.
+of creating competing app-server ownership. To keep the phone as the complete
+control plane, start the task from Console or continue it from Console after the
+externally owned turn has ended; the next turn is then owned by the bridge.
 
 ## Compatibility and change control
 

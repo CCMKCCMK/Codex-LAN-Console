@@ -46,8 +46,8 @@ A free Apple ID normally creates a personal-team provisioning profile that expir
 
 The `iOS unsigned build` workflow generates the Xcode project, runs the simulator tests, and uploads two deliberately unsigned artifacts:
 
-- `Codex-LAN-Console-iOS-v1.5.0-simulator-unsigned.zip` is a simulator `.app` and only runs in the iOS Simulator.
-- `Codex-LAN-Console-iOS-v1.5.0-unsigned.ipa` is an unsigned iPhoneOS `Payload/*.app` container intended for a signer to process with their own certificate and provisioning profile.
+- `Codex-LAN-Console-iOS-v1.6.0-simulator-unsigned.zip` is a simulator `.app` and only runs in the iOS Simulator.
+- `Codex-LAN-Console-iOS-v1.6.0-unsigned.ipa` is an unsigned iPhoneOS `Payload/*.app` container intended for a signer to process with their own certificate and provisioning profile.
 
 Neither artifact can be installed directly on a physical iPhone. The recommended route is still to build the source in Xcode with your own Team as described above; this lets Xcode create the correct entitlements and provisioning profile instead of attempting an error-prone manual re-sign.
 

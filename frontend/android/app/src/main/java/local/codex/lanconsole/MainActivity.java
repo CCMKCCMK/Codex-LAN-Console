@@ -282,7 +282,7 @@ public class MainActivity extends Activity {
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         settings.setSupportMultipleWindows(false);
         settings.setUserAgentString(
-                settings.getUserAgentString() + " CodexLanConsole/1.5.0");
+                settings.getUserAgentString() + " CodexLanConsole/1.6.0");
 
         CookieManager cookies = CookieManager.getInstance();
         cookies.setAcceptCookie(true);

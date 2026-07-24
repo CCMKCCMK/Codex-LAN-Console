@@ -1,4 +1,4 @@
-# Codex LAN Console 1.5.0
+# Codex LAN Console 1.6.0
 
 Codex LAN Console 用安卓手机或 iPhone 查看和控制这台 Windows 电脑上已经登录的 Codex/ChatGPT 编程环境。手机端不需要再登录 OpenAI、Google 或 Microsoft 账号。
 
@@ -24,6 +24,18 @@ Web 前端在构建时复制进 Windows Bridge 的 `wwwroot`，所以最终用�
 
 本项目是独立开发的软件，不隶属于 OpenAI 或 UC San Diego，也未得到其赞助或认可。使用前请阅读 [`SECURITY.md`](SECURITY.md)、[`PRIVACY.md`](PRIVACY.md) 与 [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)。
 
+## 1.6.0 的主要改进
+
+### 手机完全控制
+
+- 手机新建或续跑的任务默认使用“完全自主”：`danger-full-access + never`，仍可在输入区主动切换为项目沙箱、只读或逐项询问。
+- “完全自主”现在是桥接端强制执行的完整语义。即使 Computer Use、浏览器或其他技能额外发出工具级授权，桥接端也会在同一 app-server 连接上按正确协议直接处理，不再弹出一个只能回电脑确认的死路。
+- Computer Use 的 MCP 工具授权与普通命令审批是两层协议。Console 现在同时支持二者，并在工具允许时优先保存其明确提供的长期授权，避免同一应用反复询问。
+- `request_user_input`、标准 MCP 表单、OpenAI 扩展表单和 URL 决策都可在手机完成。字符串、密码、数字、布尔、枚举、数组和嵌套对象均有手机输入或 JSON 回退。
+- 当前时间等主机请求由 Bridge 自动回答；未来出现未实现的协议类型时会立即向 Codex 返回明确错误，使任务自行报告或改走替代方案，不会无限挂在 Pending 队列。
+
+Bridge 与 ChatGPT Desktop 仍是两个独立 app-server 连接。JSON-RPC 请求只能由收到原始 request id 的连接回答，因此一个已经由 Desktop 启动且仍在运行的旧轮次不能被 Bridge 伪造接管。要实现电脑零确认，请从手机 Console 新建任务，或在原轮次结束后由手机续跑；此后整轮都由 Bridge 持有。
+
 ## 1.5.0 的主要改进
 
 ### 真正的权限模式
@@ -38,7 +50,7 @@ Web 前端在构建时复制进 Windows Bridge 的 `wwwroot`，所以最终用�
 
 - “一键允许全部待审批”会处理当前队列中的命令、文件修改和细粒度权限请求。
 - “自动允许所有审批”是单独的高风险开关。开启后，桥接端会对后续支持的审批直接选择允许，并在重启后保持开启，直到你手动关闭。
-- 普通提问、`request_user_input` 和 MCP 表单不会被自动填写。
+- 普通提问、`request_user_input` 和业务表单不会被自动猜测；它们会在手机上显示并等待回答。只有明确标记为工具授权的 MCP 请求会随自动批准处理。
 - 已修复细粒度权限请求的协议格式；浏览器、网络或项目外目录请求现在会授予 Codex 实际请求的权限和正确的作用范围。
 
 ### 超大历史内存保护
@@ -76,7 +88,7 @@ Web 前端在构建时复制进 Windows Bridge 的 `wwwroot`，所以最终用�
 
 - 远程 Codex 任务完成、失败或中断时，安卓手机会发出系统通知。
 - 通过手机 Console 启动或继续的任务在等待批准、输入或决定时会立即提醒，常规命令/文件审批和提问可直接在手机处理。
-- 电脑端 ChatGPT/Codex 自己启动的任务也会收到完成通知；当它调用 `request_user_input` 等待回复时，手机会提示回电脑处理。
+- 电脑端 ChatGPT/Codex 自己启动的任务也会收到状态和完成通知；为了获得完整手机控制，应在该轮结束后从 Console 续跑，或直接从 Console 新建任务。
 - 手机端通过低功耗长轮询在后台工作；与页面是否打开无关，断网后会自动退避并重连。
 - 任务事件、游标和最近通知 ID 都会持久化，避免重连、重启或实时/扫描同时发现状态时重复响铃。
 - 后台通知使用的配对令牌与电脑地址由 Android Keystore 加密保存；网页配对完成后只保留 HttpOnly 会话 Cookie，不再把完整令牌长期放在 WebView 存储中。锁屏只显示通用提示，不显示任务内容。
@@ -84,7 +96,7 @@ Web 前端在构建时复制进 Windows Bridge 的 `wwwroot`，所以最终用�
 
 ### 如何开启
 
-1. 覆盖安装 `Codex-LAN-Console-v1.5.0.apk`，然后打开手机 App。
+1. 覆盖安装 `Codex-LAN-Console-v1.6.0.apk`，然后打开手机 App。
 2. 在“概览”页点击“开启通知”，并允许 Android 发送通知。
 3. 点击“试一下”验证声音和震动。小米/Redmi 如提示后台限制，再点击“后台设置”允许持续运行。
 
@@ -137,10 +149,10 @@ Web 前端在构建时复制进 Windows Bridge 的 `wwwroot`，所以最终用�
 
 - 源码目录中的 Windows 桥接端：`release\WindowsBridge\CodexLanBridge.exe`
 - 解压发布包后的 Windows 桥接端：`WindowsBridge\CodexLanBridge.exe`
-- 安卓 App：`Codex-LAN-Console-v1.5.0.apk`
-- iOS 真机包：GitHub Actions 生成的 `Codex-LAN-Console-iOS-v1.5.0-unsigned.ipa`（必须自行签名）
-- iOS 模拟器包：GitHub Actions 生成的 `Codex-LAN-Console-iOS-v1.5.0-simulator-unsigned.zip`
-- iOS 自行签名源码：`Codex-LAN-Console-iOS-v1.5.0-source.zip`（推荐在 Mac 上解压后按 `frontend/ios/README.md` 用自己的 Team 构建）
+- 安卓 App：`Codex-LAN-Console-v1.6.0.apk`
+- iOS 真机包：GitHub Actions 生成的 `Codex-LAN-Console-iOS-v1.6.0-unsigned.ipa`（必须自行签名）
+- iOS 模拟器包：GitHub Actions 生成的 `Codex-LAN-Console-iOS-v1.6.0-simulator-unsigned.zip`
+- iOS 自行签名源码：`Codex-LAN-Console-iOS-v1.6.0-source.zip`（推荐在 Mac 上解压后按 `frontend/ios/README.md` 用自己的 Team 构建）
 - 本地端口：TCP 8787
 - 配对数据、通知事件和上传文件：`%LOCALAPPDATA%\CodexLanConsole`
 - 安卓要求：Android 8.0 或更高版本
@@ -171,7 +183,7 @@ Web 前端在构建时复制进 Windows Bridge 的 `wwwroot`，所以最终用�
 
 ## 安装或升级安卓 App
 
-1. 把 `Codex-LAN-Console-v1.5.0.apk` 传到手机；已经配对的旧版本也可以直接下载这个 APK。
+1. 把 `Codex-LAN-Console-v1.6.0.apk` 传到手机；已经配对的旧版本也可以直接下载这个 APK。
 2. 打开 APK，并在安卓提示时只允许从当前来源安装。
 3. 打开 Codex LAN Console，输入 BAT 管理程序显示的一个地址。
 4. 输入当前六位配对码。
@@ -206,8 +218,8 @@ iOS 项目需要 macOS、Xcode 16 和 XcodeGen；Windows 上提交源码后，�
 
 - **手机无法连接：** 确认 BAT 管理程序显示 `RUNNING`。使用 Tailscale 时，确认两台设备在同一个 tailnet 中在线；使用局域网时，确认手机和电脑位于同一个可信网络。
 - **后台不提醒：** 先在概览页确认状态为“后台运行中”，再点击“试一下”。小米/Redmi 还应在“后台设置”中允许自启动/后台运行并将电量策略设为不限制。强行停止 App 后 Android 不允许它自行恢复，需重新打开一次。
-- **通知提示必须回电脑处理：** 常规命令、文件修改、细粒度权限审批和提问都可直接在手机处理。少数 MCP 扩展表单无法从当前协议安全还原完整选项，手机仍会提醒并打开对应任务，但不会自动猜测答案。
-- **电脑端单独启动的任务：** 当前 Codex 的待审批状态属于启动它的桌面进程，另一个桥接进程不能安全代答。Console 会通知它的完成结果，并能识别桌面任务的明确提问；桌面进程独有的系统审批仍需在电脑处理。需要完整手机审批时，请从手机 Console 启动或继续该任务。
+- **Computer Use 仍然询问：** 先确认当前任务使用“完全自主”，或开启“自动批准”。Bridge 会自动处理普通审批和 Computer Use 的独立 MCP 工具授权；普通业务问题仍会在手机等待你的答案。
+- **电脑端单独启动的活动任务：** Codex 协议把审批 request id 绑定到启动该轮的 app-server 连接，Bridge 不能对另一个进程伪造响应。要做到电脑零操作，请从手机 Console 新建任务，或等该轮结束后从手机续跑，使下一轮从开始到结束都归 Bridge 控制。
 - **看不到配对码：** 先启动桥接端，再选择 `3`。当前配对码也保存在 Windows 的 `%LOCALAPPDATA%\CodexLanConsole\pairing.txt`。
 - **文件无法上传：** 确认不超过 10 个文件、单个 128 MiB、合计 256 MiB，并在网络稳定后重试。
 - **文件卡片无法再打开：** 临时下载凭证可能已经过期。重新载入任务即可申请新的凭证。手机上传的副本最多保留 30 天。

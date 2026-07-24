@@ -32,6 +32,8 @@ public sealed class CodexAppServer : BackgroundService
     private readonly ConcurrentDictionary<long, TaskCompletionSource<JsonElement>> _calls = new();
     private readonly ConcurrentDictionary<string, byte> _loadedThreads = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _threadLoadLocks = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, ExecutionPermissions> _threadExecutionPermissions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, string> _threadWorkingDirectories = new(StringComparer.Ordinal);
     public ConcurrentDictionary<string, PendingRequest> Pending { get; } = new();
     private Process? _process;
     private StreamWriter? _input;
@@ -103,8 +105,15 @@ public sealed class CodexAppServer : BackgroundService
             var reader = Task.Run(() => ReadLoop(process, ct), ct);
             await CallAsync("initialize", new
             {
-                clientInfo = new { name = "codex-lan-console", title = "Codex LAN Console", version = "1.5.0" },
-                capabilities = new { experimentalApi = true }
+                clientInfo = new { name = "codex-lan-console", title = "Codex LAN Console", version = "1.6.0" },
+                capabilities = new
+                {
+                    experimentalApi = true,
+                    // The mobile client renders standard MCP forms and has a JSON
+                    // fallback for OpenAI extended forms, so these requests can stay
+                    // on the same bridge-owned app-server connection.
+                    mcpServerOpenaiFormElicitation = true
+                }
             }, ct);
             await SendAsync(new { method = "initialized" }, ct);
             _isReady = true;
@@ -128,6 +137,8 @@ public sealed class CodexAppServer : BackgroundService
             Pending.Clear();
             _requestIds.Clear();
             _loadedThreads.Clear();
+            _threadExecutionPermissions.Clear();
+            _threadWorkingDirectories.Clear();
             try { if (!process.HasExited) process.Kill(true); } catch { }
             process.Dispose();
             if (ReferenceEquals(_process, process)) _process = null;
@@ -191,10 +202,19 @@ public sealed class CodexAppServer : BackgroundService
                 var key = Guid.NewGuid().ToString("N");
                 var p = root.TryGetProperty("params", out var param) ? param.Clone() : JsonSerializer.SerializeToElement(new { });
                 var pending = new PendingRequest(key, method.GetString() ?? "request", p, DateTimeOffset.UtcNow);
+                if (!IsSupportedServerRequest(pending))
+                {
+                    await SendRawError(
+                        id.Clone(),
+                        -32601,
+                        $"Codex LAN Console does not implement server request '{pending.Method}'.");
+                    Console.Error.WriteLine($"Rejected unsupported app-server request: {pending.Method}");
+                    return;
+                }
                 Pending[key] = pending;
                 _requestIds[key] = id.Clone();
                 ObservePendingState(pending);
-                var autoApproval = await TryAutoApproveAsync(pending);
+                var autoApproval = await TryAutoResolveAsync(pending);
                 if (ApprovalProtocol.ShouldPublishPendingNotification(
                         autoApproval,
                         Pending.ContainsKey(pending.Key)))
@@ -284,6 +304,8 @@ public sealed class CodexAppServer : BackgroundService
             TryGetString(parameters, "threadId", out var closedThreadId))
         {
             _loadedThreads.TryRemove(closedThreadId, out _);
+            _threadExecutionPermissions.TryRemove(closedThreadId, out _);
+            _threadWorkingDirectories.TryRemove(closedThreadId, out _);
             _runtimeStates.ForgetAppServerThread(closedThreadId, generation);
             return;
         }
@@ -346,6 +368,8 @@ public sealed class CodexAppServer : BackgroundService
         var thread = result.ValueKind == JsonValueKind.Object && result.TryGetProperty("thread", out var nested) ? nested : result;
         if (!TryGetString(thread, "id", out var threadId)) return;
         _loadedThreads[threadId] = 0;
+        if (TryGetString(thread, "cwd", out var cwd))
+            _threadWorkingDirectories[threadId] = cwd;
         if (thread.TryGetProperty("status", out var status))
             _runtimeStates.ObserveAppServerStatus(threadId, status, Volatile.Read(ref _generation));
     }
@@ -357,6 +381,8 @@ public sealed class CodexAppServer : BackgroundService
         foreach (var thread in threads.EnumerateArray())
         {
             if (!TryGetString(thread, "id", out var threadId) || !thread.TryGetProperty("status", out var status)) continue;
+            if (TryGetString(thread, "cwd", out var cwd))
+                _threadWorkingDirectories[threadId] = cwd;
             _runtimeStates.ObserveAppServerStatus(threadId, status, generation);
         }
     }
@@ -461,31 +487,50 @@ public sealed class CodexAppServer : BackgroundService
         CancellationToken cancellationToken)
     {
         executionPermissions = EffectiveExecutionPermissions(executionPermissions);
+        var hadPreviousPermissions = _threadExecutionPermissions.TryGetValue(threadId, out var previousPermissions);
+        // Install the profile before turn/start so an app-server implementation
+        // that streams an immediate host request cannot race the acknowledgement.
+        // If turn/start is rejected (for example because an older turn is active),
+        // the previous profile is restored and turn/steer keeps the old semantics.
+        _threadExecutionPermissions[threadId] = executionPermissions;
+        JsonElement result;
         try
         {
-            return await CallAsync("turn/start", new
+            try
             {
-                threadId,
-                input,
-                clientUserMessageId,
-                permissions = executionPermissions.Permissions,
-                approvalPolicy = executionPermissions.ApprovalPolicy,
-                approvalsReviewer = executionPermissions.ApprovalsReviewer
-            }, cancellationToken);
+                result = await CallAsync("turn/start", new
+                {
+                    threadId,
+                    input,
+                    clientUserMessageId,
+                    permissions = executionPermissions.Permissions,
+                    approvalPolicy = executionPermissions.ApprovalPolicy,
+                    approvalsReviewer = executionPermissions.ApprovalsReviewer
+                }, cancellationToken);
+            }
+            catch (CodexRpcException ex) when (IsPermissionsFieldUnsupported(ex))
+            {
+                var cwd = await GetThreadCwdAsync(threadId, cancellationToken);
+                result = await CallAsync("turn/start", new
+                {
+                    threadId,
+                    input,
+                    clientUserMessageId,
+                    sandboxPolicy = executionPermissions.LegacyTurnSandboxPolicy(cwd),
+                    approvalPolicy = executionPermissions.ApprovalPolicy,
+                    approvalsReviewer = executionPermissions.ApprovalsReviewer
+                }, cancellationToken);
+            }
         }
-        catch (CodexRpcException ex) when (IsPermissionsFieldUnsupported(ex))
+        catch
         {
-            var cwd = await GetThreadCwdAsync(threadId, cancellationToken);
-            return await CallAsync("turn/start", new
-            {
-                threadId,
-                input,
-                clientUserMessageId,
-                sandboxPolicy = executionPermissions.LegacyTurnSandboxPolicy(cwd),
-                approvalPolicy = executionPermissions.ApprovalPolicy,
-                approvalsReviewer = executionPermissions.ApprovalsReviewer
-            }, cancellationToken);
+            if (hadPreviousPermissions && previousPermissions is not null)
+                _threadExecutionPermissions[threadId] = previousPermissions;
+            else
+                _threadExecutionPermissions.TryRemove(threadId, out _);
+            throw;
         }
+        return result;
     }
 
     public async Task<JsonElement> StartThreadAsync(
@@ -516,8 +561,19 @@ public sealed class CodexAppServer : BackgroundService
             }, cancellationToken);
         }
         MarkThreadLoaded(result);
+        var thread = result.ValueKind == JsonValueKind.Object && result.TryGetProperty("thread", out var nested)
+            ? nested
+            : result;
+        if (TryGetString(thread, "id", out var threadId))
+        {
+            _threadExecutionPermissions[threadId] = executionPermissions;
+            _threadWorkingDirectories[threadId] = cwd;
+        }
         return result;
     }
+
+    public bool TryGetKnownThreadCwd(string threadId, out string cwd) =>
+        _threadWorkingDirectories.TryGetValue(threadId, out cwd!);
 
     private ExecutionPermissions EffectiveExecutionPermissions(ExecutionPermissions requested)
         => requested.RouteApprovalsToBridge(_approvalSettings.Get().AutoApproveAll);
@@ -527,9 +583,15 @@ public sealed class CodexAppServer : BackgroundService
 
     private async Task<string> GetThreadCwdAsync(string threadId, CancellationToken cancellationToken)
     {
+        if (TryGetKnownThreadCwd(threadId, out var knownCwd)) return knownCwd;
         var result = await CallAsync("thread/read", new { threadId, includeTurns = false }, cancellationToken);
         var thread = result.TryGetProperty("thread", out var nested) ? nested : result;
-        return TryGetString(thread, "cwd", out var cwd) ? cwd : Environment.CurrentDirectory;
+        if (TryGetString(thread, "cwd", out var cwd))
+        {
+            _threadWorkingDirectories[threadId] = cwd;
+            return cwd;
+        }
+        return Environment.CurrentDirectory;
     }
 
     private static bool IsPermissionsFieldUnsupported(CodexRpcException exception)
@@ -594,7 +656,7 @@ public sealed class CodexAppServer : BackgroundService
 
         var allPending = Pending.Values.ToArray();
         var pending = allPending
-            .Where(IsApprovalRequest)
+            .Where(IsUserApprovalRequest)
             .OrderBy(request => request.CreatedAt)
             .ToArray();
         var approved = 0;
@@ -604,7 +666,17 @@ public sealed class CodexAppServer : BackgroundService
         {
             try
             {
-                if (await ResolvePendingAsync(request.Key, decision)) approved++;
+                var resolved = IsApprovalRequest(request)
+                    ? await ResolvePendingAsync(request.Key, decision)
+                    : await ResolveSystemRequestAsync(
+                        request.Key,
+                        ElicitationProtocol.BuildToolApproval(
+                            request,
+                            decision == "acceptForSession" &&
+                            ElicitationProtocol.AdvertisedPersistence(request).Contains("session", StringComparer.Ordinal)
+                                ? "session"
+                                : null));
+                if (resolved) approved++;
                 else alreadyResolved++;
             }
             catch (Exception ex)
@@ -627,13 +699,38 @@ public sealed class CodexAppServer : BackgroundService
             failed);
     }
 
-    private async Task<AutoApprovalDisposition> TryAutoApproveAsync(PendingRequest request)
+    private async Task<AutoApprovalDisposition> TryAutoResolveAsync(PendingRequest request)
     {
-        if (!IsApprovalRequest(request) || !_approvalSettings.Get().AutoApproveAll)
+        if (request.Method.Equals("currentTime/read", StringComparison.Ordinal))
+        {
+            try
+            {
+                return await ResolveSystemRequestAsync(
+                    request.Key,
+                    JsonSerializer.SerializeToElement(new
+                    {
+                        currentTimeAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                    }))
+                    ? AutoApprovalDisposition.Approved
+                    : AutoApprovalDisposition.NoLongerPending;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Automatic current-time response failed: {ex.Message}");
+                return Pending.ContainsKey(request.Key)
+                    ? AutoApprovalDisposition.Failed
+                    : AutoApprovalDisposition.NoLongerPending;
+            }
+        }
+
+        if (!IsUserApprovalRequest(request) || !ShouldAutoApprove(request))
             return AutoApprovalDisposition.NotAttempted;
         try
         {
-            if (!await ResolvePendingAsync(request.Key, "accept"))
+            var resolved = IsApprovalRequest(request)
+                ? await ResolvePendingAsync(request.Key, "accept")
+                : await ResolveSystemRequestAsync(request.Key, ElicitationProtocol.BuildAutomaticApproval(request));
+            if (!resolved)
                 return AutoApprovalDisposition.NoLongerPending;
             try { _approvalSettings.RecordAutoApprovals(1); }
             catch (Exception ex) { Console.Error.WriteLine($"Could not persist automatic approval statistics: {ex.Message}"); }
@@ -646,6 +743,14 @@ public sealed class CodexAppServer : BackgroundService
                 ? AutoApprovalDisposition.Failed
                 : AutoApprovalDisposition.NoLongerPending;
         }
+    }
+
+    private bool ShouldAutoApprove(PendingRequest request)
+    {
+        if (_approvalSettings.Get().AutoApproveAll) return true;
+        return TryGetString(request.Params, "threadId", out var threadId) &&
+               _threadExecutionPermissions.TryGetValue(threadId, out var permissions) &&
+               permissions.IsUnrestrictedAutonomy;
     }
 
     public async Task<bool> ResolveUserInputAsync(string key, IReadOnlyDictionary<string, UserInputAnswer> answers)
@@ -675,14 +780,60 @@ public sealed class CodexAppServer : BackgroundService
         return true;
     }
 
+    public async Task<bool> ResolveMcpElicitationAsync(
+        string key,
+        string action,
+        JsonElement? content,
+        string? persistence)
+    {
+        if (!Pending.TryGetValue(key, out var request) || !ElicitationProtocol.IsElicitationRequest(request))
+            return false;
+        var result = ElicitationProtocol.BuildResult(request, action, content, persistence);
+        return await ResolveSystemRequestAsync(key, result);
+    }
+
+    private async Task<bool> ResolveSystemRequestAsync(string key, JsonElement result)
+    {
+        if (!Pending.TryRemove(key, out var removed)) return false;
+        if (!_requestIds.TryRemove(key, out var id))
+        {
+            Pending.TryAdd(key, removed);
+            return false;
+        }
+        try
+        {
+            await SendRawResponse(id, result);
+            ObserveResolvedPendingState(removed);
+        }
+        catch
+        {
+            if (IsReady)
+            {
+                _requestIds.TryAdd(key, id);
+                Pending.TryAdd(key, removed);
+            }
+            throw;
+        }
+        return true;
+    }
+
     public static bool IsUserInputRequest(PendingRequest request) =>
         request.Method.Contains("requestUserInput", StringComparison.OrdinalIgnoreCase);
 
     public static bool IsUserInputLikeRequest(PendingRequest request) =>
         IsUserInputRequest(request) ||
-        request.Method.Equals("mcpServer/elicitation/request", StringComparison.Ordinal);
+        ElicitationProtocol.IsElicitationRequest(request);
 
     public static bool IsApprovalRequest(PendingRequest request) => ApprovalProtocol.IsApprovalRequest(request);
+
+    public static bool IsUserApprovalRequest(PendingRequest request) =>
+        IsApprovalRequest(request) || ElicitationProtocol.IsToolApproval(request);
+
+    public static bool IsSupportedServerRequest(PendingRequest request) =>
+        IsApprovalRequest(request) ||
+        IsUserInputRequest(request) ||
+        ElicitationProtocol.IsElicitationRequest(request) ||
+        request.Method.Equals("currentTime/read", StringComparison.Ordinal);
 
     private static bool TryBuildAnswers(
         JsonElement parameters,
@@ -703,6 +854,9 @@ public sealed class CodexAppServer : BackgroundService
     }
 
     private async Task SendRawResponse(JsonElement id, object result) => await SendAsync(new { id, result }, CancellationToken.None);
+
+    private async Task SendRawError(JsonElement id, int code, string message) =>
+        await SendAsync(new { id, error = new { code, message } }, CancellationToken.None);
 
     public async Task<JsonElement> CallAsync(string method, object? parameters, CancellationToken ct = default)
     {

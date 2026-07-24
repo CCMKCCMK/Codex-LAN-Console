@@ -47,6 +47,18 @@
     grid-column: 1 / -1;
   }
 
+  .tool-approval-card .elicitation-actions .danger:last-child {
+    grid-column: auto;
+  }
+
+  .elicitation-object {
+    padding: 9px !important;
+  }
+
+  .elicitation-details > div {
+    grid-template-columns: minmax(72px, .35fr) minmax(0, 1fr);
+  }
+
   .approval-automation {
     padding: 13px;
   }
@@ -150,12 +162,19 @@
   }
 
   .approval-card .actions,
+  .elicitation-actions,
+  .elicitation-secondary-actions,
   .risk-actions {
     grid-template-columns: minmax(0, 1fr);
   }
 
   .approval-card .actions .danger:last-child {
     grid-column: auto;
+  }
+
+  .elicitation-details > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 3px;
   }
 
   .execution-presets {

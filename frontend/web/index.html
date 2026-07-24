@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#0c0f0e"><title>Codex LAN Console</title>
-  <link rel="manifest" href="/manifest.webmanifest"><link rel="stylesheet" href="/styles.css?v=27"><link rel="stylesheet" href="/mobile.css?v=27">
+  <link rel="manifest" href="/manifest.webmanifest"><link rel="stylesheet" href="/styles.css?v=28"><link rel="stylesheet" href="/mobile.css?v=28">
 </head>
 <body>
   <div id="pair" class="overlay hidden">
@@ -15,7 +15,7 @@
     </form>
   </div>
 
-  <header><div><span class="eyebrow">LOCAL ONLY · 1.5.0</span><h1>Codex Console</h1></div><button id="refresh" class="icon">↻</button></header>
+  <header><div><span class="eyebrow">LOCAL ONLY · 1.6.0</span><h1>Codex Console</h1></div><button id="refresh" class="icon">↻</button></header>
   <aside id="autoApproveBanner" class="auto-approve-banner hidden" role="status" aria-live="polite">
     <div><b>自动允许后续审批已开启</b><small>Console 管理的新审批会直接选择 Yes；需要回答的问题不会自动处理。</small></div>
     <button type="button" id="manageAutoApprove" class="secondary">管理</button>
@@ -89,10 +89,10 @@
             <button type="button" data-execution-preset="unrestricted">完全自主</button>
           </div>
           <div class="execution-settings">
-            <label>文件与系统权限<select id="runtimePermission"><option value=":read-only">只读（禁止修改）</option><option value=":workspace" selected>项目范围（沙箱）</option><option value=":danger-full-access">整台电脑（无沙箱）</option></select></label>
-            <label>遇到风险操作时<select id="approvalMode"><option value="auto" selected>交给 Codex 审核（不是全同意）</option><option value="ask">在手机上问我</option><option value="never">不发起审批，直接运行</option><option value="strict">更多操作都问我</option></select></label>
+            <label>文件与系统权限<select id="runtimePermission"><option value=":read-only">只读（禁止修改）</option><option value=":workspace">项目范围（沙箱）</option><option value=":danger-full-access" selected>整台电脑（无沙箱）</option></select></label>
+            <label>遇到风险操作时<select id="approvalMode"><option value="auto">交给 Codex 审核（不是全同意）</option><option value="ask">在手机上问我</option><option value="never" selected>不发起审批，直接运行</option><option value="strict">更多操作都问我</option></select></label>
           </div>
-          <p id="permissionHint" class="permission-hint">项目沙箱限制修改范围；Codex 风险审核会逐项判断，并不是全部同意。</p>
+          <p id="permissionHint" class="permission-hint">完全自主：整台电脑无沙箱运行，不发起逐项审批。</p>
         </details>
         <div class="composer-footer"><button type="button" id="interruptTurn" class="danger hidden">停止</button><small id="sendMode">发送新的指令</small><button id="sendMessage" type="submit">发送</button></div>
       </form>
@@ -118,5 +118,5 @@
       <div class="risk-actions"><button type="button" id="riskCancel" class="secondary">取消</button><button type="button" id="riskConfirm" class="danger" disabled>确认启用</button></div>
     </section>
   </div>
-  <div id="toast"></div><script src="/marked.umd.js?v=27"></script><script src="/app.js?v=27"></script>
+  <div id="toast"></div><script src="/marked.umd.js?v=28"></script><script src="/app.js?v=28"></script>
 </body></html>

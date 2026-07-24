@@ -225,10 +225,27 @@ app.MapGet("/api/threads/{id}", async (
         }, statusCode: StatusCodes.Status426UpgradeRequired);
     }
 
-    var metadata = await codex.CallAsync(
-        "thread/read",
-        new { threadId = id, includeTurns = false },
-        cancellationToken);
+    JsonElement metadata;
+    try
+    {
+        metadata = await codex.CallAsync(
+            "thread/read",
+            new { threadId = id, includeTurns = false },
+            cancellationToken);
+    }
+    catch (CodexRpcException ex) when (ApiHelpers.IsUnmaterializedThread(ex))
+    {
+        codex.TryGetKnownThreadCwd(id, out var knownCwd);
+        metadata = JsonSerializer.SerializeToElement(new
+        {
+            thread = new
+            {
+                id,
+                cwd = knownCwd,
+                status = new { type = "notLoaded" }
+            }
+        });
+    }
     try
     {
         var turnPage = await codex.CallAsync(
@@ -346,11 +363,38 @@ app.MapPost("/api/threads/{id}/interrupt", async (
 });
 
 app.MapGet("/api/approvals", (CodexAppServer codex) =>
-    codex.Pending.Values.Where(CodexAppServer.IsApprovalRequest).OrderByDescending(x => x.CreatedAt));
+    codex.Pending.Values.Where(CodexAppServer.IsUserApprovalRequest).OrderByDescending(x => x.CreatedAt));
 app.MapPost("/api/approvals/{key}", async (string key, ApprovalDecision request, CodexAppServer codex) =>
 {
     if (request.Decision is not ("accept" or "acceptForSession" or "decline" or "cancel"))
         return Results.BadRequest(new { error = "Invalid decision." });
+    if (!codex.Pending.TryGetValue(key, out var pending)) return Results.NotFound();
+    if (ElicitationProtocol.IsToolApproval(pending))
+    {
+        try
+        {
+            var accepting = request.Decision is "accept" or "acceptForSession";
+            var persistence = request.Decision == "acceptForSession" &&
+                              ElicitationProtocol.AdvertisedPersistence(pending).Contains("session", StringComparer.Ordinal)
+                ? "session"
+                : null;
+            if (accepting)
+                return await codex.ResolveMcpElicitationAsync(
+                        key,
+                        "accept",
+                        ElicitationProtocol.BuildToolApproval(pending, persistence).GetProperty("content"),
+                        persistence)
+                    ? Results.Ok()
+                    : Results.NotFound();
+            return await codex.ResolveMcpElicitationAsync(key, request.Decision, null, null)
+                ? Results.Ok()
+                : Results.NotFound();
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidDataException)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+    }
     return await codex.ResolvePendingAsync(key, request.Decision) ? Results.Ok() : Results.NotFound();
 });
 
@@ -391,6 +435,33 @@ app.MapPost("/api/pending/{key}/answers", async (string key, UserInputResponse r
     return await codex.ResolveUserInputAsync(key, request.Answers)
         ? Results.Ok()
         : Results.BadRequest(new { error = "Please answer every question before sending." });
+});
+
+app.MapPost("/api/pending/{key}/elicitation", async (
+    string key,
+    ElicitationResponse request,
+    CodexAppServer codex) =>
+{
+    if (!codex.Pending.TryGetValue(key, out var pending))
+        return Results.NotFound(new { error = "This request has already been handled." });
+    if (!ElicitationProtocol.IsElicitationRequest(pending))
+        return Results.BadRequest(new { error = "This pending item is not an MCP form." });
+    if (request.Action is not ("accept" or "decline" or "cancel"))
+        return Results.BadRequest(new { error = "Invalid elicitation action." });
+    try
+    {
+        return await codex.ResolveMcpElicitationAsync(
+                key,
+                request.Action,
+                request.Content,
+                request.Persistence)
+            ? Results.Ok()
+            : Results.NotFound(new { error = "This request has already been handled." });
+    }
+    catch (ArgumentException ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
 });
 
 app.MapPost("/api/files/upload", async (HttpContext context, FileTransferService files) =>
@@ -652,6 +723,7 @@ record ApprovalDecision(string Decision);
 record ApprovalBatchDecision(string Decision);
 record ApprovalSettingsUpdate(bool AutoApproveAll, string? Confirmation);
 record UserInputResponse(Dictionary<string, UserInputAnswer> Answers);
+record ElicitationResponse(string Action, JsonElement? Content, string? Persistence);
 record LocalLinkRequest(string Url);
 record StopProcessRequest(string Confirmation);
 
@@ -685,7 +757,7 @@ static class ApiHelpers
         if (!runtimeStates.IsExternallyOwnedActive(threadId)) return null;
         return Results.Conflict(new
         {
-            error = "This task is currently running in Codex Desktop. Wait for that turn to finish or control it from the computer.",
+            error = "This turn belongs to another Codex app-server connection. Start a mobile-owned task, or continue this task from the phone after the current turn finishes.",
             kind = "externalThreadActive",
             threadId
         });
@@ -770,7 +842,9 @@ static class ApiHelpers
 
     public static bool IsUnmaterializedThread(CodexRpcException exception) =>
         exception.Message.Contains("not materialized", StringComparison.OrdinalIgnoreCase) ||
-        exception.Message.Contains("before first user message", StringComparison.OrdinalIgnoreCase);
+        exception.Message.Contains("before first user message", StringComparison.OrdinalIgnoreCase) ||
+        (exception.Message.Contains("rollout", StringComparison.OrdinalIgnoreCase) &&
+         exception.Message.Contains("empty", StringComparison.OrdinalIgnoreCase));
 
     private static JsonElement BoundForMobile(JsonElement element)
     {
@@ -874,6 +948,7 @@ static class ApiHelpers
 
     public static async Task<string> GetThreadCwdAsync(CodexAppServer codex, string threadId, CancellationToken cancellationToken)
     {
+        if (codex.TryGetKnownThreadCwd(threadId, out var knownCwd)) return knownCwd;
         JsonElement result = default;
         var retryDelays = new[] { 100, 300, 800, 1600 };
         for (var attempt = 0; ; attempt++)

@@ -90,6 +90,12 @@ features intentionally reduce safeguards and may allow file deletion, process
 execution, network access, credential access, or other destructive actions
 under the current Windows user.
 
+For a bridge-owned full-autonomous turn, residual app-server approvals are
+treated as part of that same explicit choice. MCP tool approvals such as
+Computer Use may persist an `always` grant only when the tool itself advertises
+that option. Ordinary questions and business forms are never guessed or
+auto-filled.
+
 They must remain opt-in, visibly identified, and disabled unless the user
 understands the consequences. They must not bypass an administrator or
 enterprise policy. Security reports about an unexpected privilege escalation

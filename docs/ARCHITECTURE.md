@@ -52,6 +52,9 @@ The ASP.NET Core bridge:
   and output;
 - paginates and bounds task data for mobile display;
 - tracks approval, question, task, and notification state;
+- dispatches every app-server host request to a protocol-specific handler,
+  including MCP elicitations and automatic current-time responses, and rejects
+  unknown future methods immediately instead of leaving a turn blocked;
 - validates and stores uploads, and leases workspace files for authenticated
   viewing or download;
 - lists related projects and processes and supports narrowly confirmed process
@@ -70,7 +73,8 @@ are rejected when concurrent control would be unsafe.
 The web frontend renders tasks, Markdown, projects, processes, approvals,
 questions, permissions, files, commands, skills, tools, goals, and status. It
 loads only the newest bounded task page by default and requests older pages
-explicitly.
+explicitly. MCP form and URL elicitations are rendered as native mobile
+controls with a JSON-object fallback for extended schemas.
 
 The Android client stores connection credentials with Android Keystore,
 supports system file selection and download, and maintains an opt-in foreground
@@ -111,7 +115,10 @@ or references them but does not own their lifecycle.
 
 Task execution combines a sandbox profile with an approval policy. Presets range
 from read-only to full autonomous. Full autonomous maps to full filesystem
-access and no per-operation approval. Persistent auto-approval is a separate,
+access and no per-operation approval. For a bridge-owned full-autonomous turn,
+the bridge also resolves residual protocol-level command, file, permission, and
+MCP tool approvals; this keeps `never` meaningful even when a skill has its own
+authorization layer. Persistent global auto-approval remains a separate,
 explicit bridge setting.
 
 Organization and administrator policies remain authoritative. The frontend

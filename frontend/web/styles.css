@@ -846,6 +846,180 @@ small {
   min-width: 92px;
 }
 
+.required-mark,
+.optional-mark {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  vertical-align: 1px;
+}
+
+.required-mark {
+  background: rgba(255, 173, 92, .15);
+  color: #ffc078;
+}
+
+.optional-mark {
+  background: rgba(141, 160, 151, .12);
+  color: var(--muted);
+}
+
+.question-card .elicitation-object {
+  margin-top: 14px;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: rgba(8, 12, 10, .28);
+}
+
+.question-card .elicitation-object > .question-field:first-of-type {
+  margin-top: 8px;
+}
+
+.elicitation-json,
+.elicitation-advanced textarea,
+.elicitation-json-fallback textarea {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.elicitation-json-field > small,
+.elicitation-advanced > small {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.elicitation-advanced {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(8, 12, 10, .28);
+}
+
+.elicitation-advanced summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.elicitation-advanced[open] summary {
+  margin-bottom: 9px;
+}
+
+.elicitation-json-fallback {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.boolean-option {
+  min-height: 48px;
+}
+
+.elicitation-details {
+  display: grid;
+  margin: 11px 0 0;
+  gap: 7px;
+}
+
+.elicitation-details > div {
+  display: grid;
+  grid-template-columns: minmax(82px, .35fr) minmax(0, 1fr);
+  gap: 9px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, .2);
+}
+
+.elicitation-details dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.elicitation-details dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.tool-approval-extra {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.tool-approval-extra > p {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.elicitation-risk {
+  display: inline-block;
+  margin: 12px 0 8px;
+  padding: 4px 8px;
+  border: 1px solid #8b6e3c;
+  border-radius: 999px;
+  background: rgba(139, 110, 60, .16);
+  color: #ffd68b;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.elicitation-risk.high {
+  border-color: #914c4c;
+  background: rgba(145, 76, 76, .16);
+  color: #ffaaaa;
+}
+
+.elicitation-link {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 46px;
+  margin-top: 12px;
+  padding: 10px 13px;
+  overflow-wrap: anywhere;
+  border: 1px solid #4f9b79;
+  border-radius: 12px;
+  background: var(--green-soft);
+  color: var(--green);
+  font-weight: 750;
+  text-align: center;
+  text-decoration: none;
+}
+
+.elicitation-invalid {
+  padding: 9px 11px;
+  border: 1px solid #914c4c;
+  border-radius: 10px;
+  background: rgba(145, 76, 76, .12);
+  color: #ffaaaa !important;
+}
+
+.elicitation-actions,
+.elicitation-secondary-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.elicitation-actions button,
+.elicitation-secondary-actions button {
+  width: 100%;
+}
+
+.elicitation-submit + .elicitation-secondary-actions {
+  margin-top: 8px;
+}
+
 .approval-command {
   display: block;
   width: 100%;

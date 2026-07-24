@@ -14,6 +14,35 @@ and do not promise a stable public API.
 - Third-party attribution and an explicit public-release licensing checklist.
 - Clear frontend/backend repository boundaries and coordinated CI coverage.
 
+## 1.6.0 - 2026-07-24
+
+### Added
+
+- Complete mobile handling for MCP form, OpenAI form, URL, and Computer Use
+  tool-approval elicitations.
+- Automatic host-time responses and explicit failure responses for unknown
+  app-server request types so turns cannot remain pending forever.
+
+### Changed
+
+- New mobile installations start from the full-autonomous execution preset,
+  with the existing one-time risk acknowledgement and lower-permission choices
+  still available.
+- Full-autonomous bridge-owned turns now auto-resolve residual command, file,
+  permission, and MCP tool approvals without depending on the separate global
+  auto-approval switch.
+
+### Fixed
+
+- Computer Use no longer reaches a phone-side dead end asking the user to
+  return to the Windows desktop.
+- MCP server requests are answered on the same app-server connection and with
+  their protocol-specific response shape.
+- One-time and session tool approvals can no longer inherit a longer-lived
+  scope from a form default, constant, enum value, or manually submitted JSON.
+- A newly created mobile task can be opened before its first message without
+  surfacing the transient empty-rollout error.
+
 ## 1.5.0 - 2026-07-22
 
 ### Added
