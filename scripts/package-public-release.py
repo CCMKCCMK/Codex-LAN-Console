@@ -9,6 +9,7 @@ files=[]
 for file in source.rglob('*'):
     if not file.is_file():continue
     name=file.relative_to(source)
+    if any(p in {'tmp','artifacts','bin','obj','release'} for p in name.parts):continue
     if file.suffix.lower()=='.pdb' or file.name=='appsettings.Development.json' or file.name.endswith('.test.cjs'):continue
     if file.suffix.lower() in {'.jks','.key','.pem','.jsonl','.log','.bak'} or any(p in {'Scooter','Uploads','AppData'} for p in name.parts):
         raise SystemExit('Unexpected private file: '+str(name))
