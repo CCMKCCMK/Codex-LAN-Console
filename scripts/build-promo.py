@@ -87,5 +87,8 @@ def make(name,w,h,audio):
        '-af','apad=pad_dur=1.2','-t',str(duration),'-movflags','+faststart',str(final)],check=True)
     print(f'{final} | {duration:.1f}s | {final.stat().st_size} bytes',flush=True)
 
-make('bilibili-1.9.0',1280,720,OUT/'voice.wav')
-make('douyin-1.9.0',720,1280,OUT/'voice-short.wav')
+if __name__ == '__main__':
+    make('bilibili-1.9.0',1280,720,OUT/'voice.wav')
+    make('douyin-1.9.0',720,1280,OUT/'voice-short.wav')
+    draw_card(900,1200,SLIDES[0]).save(OUT/'douyin-cover-3x4.jpg',quality=94)
+    draw_card(1200,900,SLIDES[0]).save(OUT/'douyin-cover-4x3.jpg',quality=94)
