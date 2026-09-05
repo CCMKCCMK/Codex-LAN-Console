@@ -41,7 +41,8 @@ public sealed class NotificationMonitor : BackgroundService
                 Console.Error.WriteLine($"Notification reconciliation failed: {ex.Message}");
             }
 
-            await Task.Delay(ScanInterval, stoppingToken);
+            try { await Task.Delay(ScanInterval, stoppingToken); }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
         }
     }
 
@@ -286,6 +287,7 @@ public sealed class NotificationMonitor : BackgroundService
     private static long Integer(JsonElement element, string name) =>
         element.ValueKind == JsonValueKind.Object &&
         element.TryGetProperty(name, out var value) &&
+        value.ValueKind == JsonValueKind.Number &&
         value.TryGetInt64(out var result)
             ? result
             : 0;

@@ -127,6 +127,23 @@ public sealed class NotificationStore
         };
     }
 
+    public NotificationEvent? PublishTurnRecovering(
+        string threadId,
+        string turnId,
+        int attempt,
+        int maximumAttempts,
+        DateTimeOffset? createdAt = null) =>
+        Publish(
+            $"turn:{threadId}:{turnId}:recovering:{attempt}",
+            "task_recovering",
+            threadId,
+            turnId,
+            null,
+            "Codex 网络中断，正在自动续接",
+            $"任务会从当前进度继续（第 {attempt}/{maximumAttempts} 次）。",
+            false,
+            createdAt);
+
     public NotificationEvent? PublishDesktopInputRequired(
         string threadId,
         string callId,

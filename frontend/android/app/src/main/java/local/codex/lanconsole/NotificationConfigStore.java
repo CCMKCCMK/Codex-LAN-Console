@@ -35,6 +35,9 @@ final class NotificationConfigStore {
     private static final String KEY_PERMISSION_REQUESTED = "permission_requested";
     private static final String KEY_LAST_ERROR = "last_error";
     private static final String KEY_GENERATION = "generation";
+    private static final String KEY_WIDGET_QUOTA = "widget_quota";
+    private static final String KEY_WIDGET_QUOTA_SAVED_AT = "widget_quota_saved_at";
+    private static final String KEY_WIDGET_QUOTA_ERROR = "widget_quota_error";
     private static final int MAX_SEEN_IDS = 256;
 
     private NotificationConfigStore() {}
@@ -59,6 +62,9 @@ final class NotificationConfigStore {
                         .remove(KEY_CURSOR)
                         .remove(KEY_SEEN_IDS)
                         .remove(KEY_LAST_ERROR)
+                        .remove(KEY_WIDGET_QUOTA)
+                        .remove(KEY_WIDGET_QUOTA_SAVED_AT)
+                        .remove(KEY_WIDGET_QUOTA_ERROR)
                         .putLong(KEY_GENERATION, generation(context) + 1L);
             }
             return editor.commit();
@@ -86,6 +92,9 @@ final class NotificationConfigStore {
                     .putBoolean(KEY_ENABLED, false)
                     .remove(KEY_CURSOR)
                     .remove(KEY_SEEN_IDS)
+                    .remove(KEY_WIDGET_QUOTA)
+                    .remove(KEY_WIDGET_QUOTA_SAVED_AT)
+                    .remove(KEY_WIDGET_QUOTA_ERROR)
                     .apply();
             return null;
         }
@@ -186,6 +195,55 @@ final class NotificationConfigStore {
             editor.remove(KEY_LAST_ERROR);
         } else {
             editor.putString(KEY_LAST_ERROR, message);
+        }
+        editor.apply();
+    }
+
+    static synchronized boolean saveWidgetQuota(Context context, String payload) {
+        if (isEmpty(payload)) {
+            return false;
+        }
+        try {
+            return prefs(context).edit()
+                    .putString(KEY_WIDGET_QUOTA, encrypt(payload))
+                    .putLong(KEY_WIDGET_QUOTA_SAVED_AT, System.currentTimeMillis())
+                    .remove(KEY_WIDGET_QUOTA_ERROR)
+                    .commit();
+        } catch (GeneralSecurityException | JSONException error) {
+            return false;
+        }
+    }
+
+    static synchronized String widgetQuota(Context context) {
+        String encoded = prefs(context).getString(KEY_WIDGET_QUOTA, null);
+        if (isEmpty(encoded)) {
+            return "";
+        }
+        try {
+            return decrypt(encoded);
+        } catch (GeneralSecurityException | JSONException | IllegalArgumentException error) {
+            prefs(context).edit()
+                    .remove(KEY_WIDGET_QUOTA)
+                    .remove(KEY_WIDGET_QUOTA_SAVED_AT)
+                    .apply();
+            return "";
+        }
+    }
+
+    static long widgetQuotaSavedAt(Context context) {
+        return prefs(context).getLong(KEY_WIDGET_QUOTA_SAVED_AT, 0L);
+    }
+
+    static String widgetQuotaError(Context context) {
+        return prefs(context).getString(KEY_WIDGET_QUOTA_ERROR, "");
+    }
+
+    static void setWidgetQuotaError(Context context, String message) {
+        SharedPreferences.Editor editor = prefs(context).edit();
+        if (isEmpty(message)) {
+            editor.remove(KEY_WIDGET_QUOTA_ERROR);
+        } else {
+            editor.putString(KEY_WIDGET_QUOTA_ERROR, message);
         }
         editor.apply();
     }

@@ -35,7 +35,10 @@ a public remote-execution service.
    boundary.
 5. **Bridge to localhost service:** a relay temporarily extends a loopback-only
    HTTP service onto one private interface and granted client address.
-6. **Project to third-party services:** Codex, OpenAI, Tailscale, Headscale,
+6. **Administrator Bridge to Windows:** an explicitly elevated Bridge and its
+   child tasks cross the UAC boundary; the paired phone becomes an administrator
+   capability.
+7. **Project to third-party services:** Codex, OpenAI, Tailscale, Headscale,
    GitHub, Apple, Google, Microsoft, and platform services have separate trust
    and policy boundaries.
 
@@ -74,9 +77,10 @@ must remain a release-blocking warning.
 **Threat:** guessing a six-digit code, stealing a raw bearer token, or using a
 lost unlocked phone.
 
-**Controls:** random code, per-client and global failure limits, 256-bit device
-token, token hashing on Windows, Android Keystore encryption, iOS Keychain,
-HttpOnly SameSite cookie, and code rotation after pairing.
+**Controls:** random ten-minute code, per-client and global failure limits,
+256-bit device token, token hashing on Windows, Android Keystore encryption,
+iOS Keychain, HttpOnly SameSite cookie, and immediate code invalidation after
+pairing.
 
 **Residual risk:** the code exists in plaintext locally, a token remains valid
 until bridge data is removed, and there is no individual device-revocation UI.
@@ -94,6 +98,28 @@ policy precedence.
 **Residual risk:** full autonomous mode intentionally removes important
 safeguards. Approval is not a malware detector. Backups, least privilege, and a
 stopped bridge remain necessary.
+
+### Windows Administrator Mode
+
+**Threat:** a user-writable elevated executable, reused ordinary token, exposed
+LAN listener, compromised paired phone, or misleading UI silently converts
+ordinary remote control into administrator execution.
+
+**Controls:** one local UAC consent; hash-checked versioned release copied under
+Program Files; protected non-inherited ACLs; Highest task path validation;
+separate per-SID protected device store; UAC-protected local opening of a
+ten-minute, one-enrollment window; authenticated status; and
+loopback/Tailscale-only binding. Existing device hashes survive later enrollment.
+The secure desktop is neither disabled nor remotely automated.
+
+**Residual risk:** during first activation, another process with the same user
+token can read the short-lived pairing code or tamper with the unsigned,
+user-writable bootstrap before consent. Copy hashes are not publisher
+authentication. Codex and invoked user-writable project tools inherit the
+administrator token by design. A compromised paired phone, tailnet, local
+administrator, SYSTEM process, or elevated Bridge has full administrator impact.
+SmartScreen, credential, Windows Hello, and driver prompts can still require
+local interaction.
 
 ### Concurrent task ownership
 

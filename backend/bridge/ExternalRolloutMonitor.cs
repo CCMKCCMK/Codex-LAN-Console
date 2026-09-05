@@ -32,6 +32,7 @@ public sealed class ExternalRolloutMonitor : BackgroundService
 
     private readonly NotificationStore _notifications;
     private readonly ThreadRuntimeStateStore _runtimeStates;
+    private readonly ThreadLiveEventStore _liveEvents;
     private readonly string _sessionsRoot;
     private readonly Channel<string> _signals = Channel.CreateBounded<string>(new BoundedChannelOptions(256)
     {
@@ -42,10 +43,14 @@ public sealed class ExternalRolloutMonitor : BackgroundService
     private readonly Dictionary<string, FileTailState> _states = new(StringComparer.OrdinalIgnoreCase);
     private FileSystemWatcher? _watcher;
 
-    public ExternalRolloutMonitor(NotificationStore notifications, ThreadRuntimeStateStore runtimeStates)
+    public ExternalRolloutMonitor(
+        NotificationStore notifications,
+        ThreadRuntimeStateStore runtimeStates,
+        ThreadLiveEventStore liveEvents)
     {
         _notifications = notifications;
         _runtimeStates = runtimeStates;
+        _liveEvents = liveEvents;
         var codexHome = Environment.GetEnvironmentVariable("CODEX_HOME");
         if (string.IsNullOrWhiteSpace(codexHome))
             codexHome = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex");
@@ -160,7 +165,8 @@ public sealed class ExternalRolloutMonitor : BackgroundService
         var previousOffset = state.Offset;
         var batch = await ReadTailAsync(path, state, null, cancellationToken);
         if (state.Offset > previousOffset) state.LastActivityAt = SafeLastWriteTime(path) ?? state.LastActivityAt;
-        PublishUnresolved(state.ThreadId, batch);
+        PublishUnresolved(state, batch);
+        PublishLive(state, batch);
         PublishRuntime(state);
         if (batch.HasUnreadBytes) _signals.Writer.TryWrite(path);
     }
@@ -190,7 +196,8 @@ public sealed class ExternalRolloutMonitor : BackgroundService
         if (baseline && start > 0)
             await SeedLatestLifecycleAsync(path, state, length, cancellationToken);
         var batch = await ReadTailAsync(path, state, length, cancellationToken);
-        PublishUnresolved(threadId, batch);
+        PublishUnresolved(state, batch);
+        PublishLive(state, batch);
         PublishRuntime(state);
         if (batch.HasUnreadBytes) _signals.Writer.TryWrite(path);
     }
@@ -392,8 +399,10 @@ public sealed class ExternalRolloutMonitor : BackgroundService
     {
         if (line.Length == 0) return;
         if (line[^1] == (byte)'\r') line = line[..^1];
-        if (line.IndexOf("request_user_input"u8) < 0 &&
-            line.IndexOf("function_call_output"u8) < 0 &&
+        if (line.IndexOf("\"type\":\"response_item\""u8) < 0 &&
+            line.IndexOf("\"type\":\"turn_context\""u8) < 0 &&
+            line.IndexOf("mcp_tool_call_end"u8) < 0 &&
+            line.IndexOf("patch_apply_end"u8) < 0 &&
             line.IndexOf("task_started"u8) < 0 &&
             line.IndexOf("task_complete"u8) < 0 &&
             line.IndexOf("turn_aborted"u8) < 0) return;
@@ -402,43 +411,267 @@ public sealed class ExternalRolloutMonitor : BackgroundService
         {
             using var document = JsonDocument.Parse(line.ToArray());
             var root = document.RootElement;
-            if (StringPropertyEquals(root, "type", "event_msg") &&
-                root.TryGetProperty("payload", out var lifecycle) &&
-                lifecycle.ValueKind == JsonValueKind.Object)
+            var observedAt = ParseTimestamp(root);
+            if (StringPropertyEquals(root, "type", "turn_context") &&
+                root.TryGetProperty("payload", out var turnContext) &&
+                turnContext.ValueKind == JsonValueKind.Object &&
+                Text(turnContext, "turn_id") is { } contextTurnId)
             {
-                var eventType = Text(lifecycle, "type");
+                state.AssumeActiveTurn(contextTurnId, observedAt);
+                batch.RememberTurn(contextTurnId, "running", observedAt);
+                return;
+            }
+            if (StringPropertyEquals(root, "type", "event_msg") &&
+                root.TryGetProperty("payload", out var eventPayload) &&
+                eventPayload.ValueKind == JsonValueKind.Object)
+            {
+                var eventType = Text(eventPayload, "type");
                 if (eventType is "task_started" or "task_complete" or "turn_aborted")
                 {
-                    state.ObserveLifecycle(eventType, Text(lifecycle, "turn_id"), ParseTimestamp(root));
+                    var turnId = Text(eventPayload, "turn_id") ?? state.ActiveTurnId;
+                    if (!string.IsNullOrWhiteSpace(turnId)) batch.RememberTurn(turnId, eventType, observedAt);
+                    state.ObserveLifecycle(eventType, turnId, observedAt);
                 }
+                else if (eventType == "patch_apply_end" &&
+                         ProjectPatchItem(eventPayload, observedAt) is { } patchItem &&
+                         (Text(eventPayload, "turn_id") ?? state.ActiveTurnId) is { } patchTurnId)
+                {
+                    state.AssumeActiveTurn(patchTurnId, observedAt);
+                    batch.RememberItem(patchTurnId, patchItem, observedAt);
+                }
+                else if (eventType == "mcp_tool_call_end" &&
+                         ProjectMcpItem(eventPayload, observedAt) is { } mcpItem &&
+                         state.ActiveTurnId is { } mcpTurnId)
+                    batch.RememberItem(mcpTurnId, mcpItem, observedAt);
                 return;
             }
             if (!StringPropertyEquals(root, "type", "response_item") ||
                 !root.TryGetProperty("payload", out var payload) ||
                 payload.ValueKind != JsonValueKind.Object) return;
 
+            if (ResponseTurnId(payload) is { } responseTurnId)
+                state.AssumeActiveTurn(responseTurnId, observedAt);
+            var payloadType = Text(payload, "type") ?? "";
+            if (payloadType == "reasoning")
+            {
+                if (state.ActiveTurnId is { } reasoningTurnId)
+                {
+                    foreach (var completed in state.CompleteProcesses(observedAt))
+                        batch.RememberItem(reasoningTurnId, completed, observedAt);
+                    if (ProjectReasoningItem(payload, observedAt) is { } reasoningItem)
+                        batch.RememberItem(reasoningTurnId, reasoningItem, observedAt);
+                }
+                return;
+            }
+            if (payloadType is "message" or "agent_message")
+            {
+                if (state.ActiveTurnId is { } messageTurnId)
+                {
+                    foreach (var completed in state.CompleteProcesses(observedAt))
+                        batch.RememberItem(messageTurnId, completed, observedAt);
+                    if (ProjectAgentItem(payload, observedAt) is { } messageItem)
+                        batch.RememberItem(messageTurnId, messageItem, observedAt);
+                }
+                return;
+            }
+
             var callId = Text(payload, "call_id");
             if (callId is null || callId.Length > 256) return;
-            if (StringPropertyEquals(payload, "type", "function_call") &&
-                StringPropertyEquals(payload, "name", "request_user_input"))
+            if (payloadType == "function_call" && StringPropertyEquals(payload, "name", "request_user_input"))
             {
                 var createdAt = ParseTimestamp(root);
                 batch.RememberCall(callId, createdAt);
                 state.RememberCall(callId, createdAt);
             }
-            else if (StringPropertyEquals(payload, "type", "function_call_output"))
+            else if (payloadType is "custom_tool_call" or "function_call")
+            {
+                var name = Text(payload, "name") ?? "tool";
+                var process = state.RememberProcess(callId, ProcessType(name), name, observedAt);
+                if (state.ActiveTurnId is { } processTurnId)
+                    batch.RememberItem(processTurnId, process, observedAt);
+            }
+            else if (payloadType is "custom_tool_call_output" or "function_call_output")
             {
                 batch.Resolve(callId);
-                state.Resolve(callId, ParseTimestamp(root));
+                state.Resolve(callId, observedAt);
+                if (state.ActiveTurnId is { } completedTurnId)
+                    batch.RememberItem(completedTurnId, state.CompleteProcess(callId, observedAt), observedAt);
             }
         }
         catch (JsonException) { }
     }
 
-    private void PublishUnresolved(string threadId, ScanBatch batch)
+    private static JsonElement? ProjectReasoningItem(JsonElement payload, DateTimeOffset? observedAt)
     {
+        if (!payload.TryGetProperty("summary", out var summary) || summary.ValueKind != JsonValueKind.Array) return null;
+        var parts = summary.EnumerateArray()
+            .Take(8)
+            .Select(value => value.ValueKind == JsonValueKind.String ? value.GetString() : Text(value, "text"))
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => BoundText(value!, 2_048))
+            .ToArray();
+        if (parts.Length == 0) return null;
+        return JsonSerializer.SerializeToElement(new
+        {
+            type = "reasoning",
+            id = Text(payload, "id") ?? $"external-reasoning-{Guid.NewGuid():N}",
+            summary = parts,
+            createdAt = UnixSeconds(observedAt)
+        });
+    }
+
+    private static JsonElement? ProjectAgentItem(JsonElement payload, DateTimeOffset? observedAt)
+    {
+        if (Text(payload, "role") is { } role && !role.Equals("assistant", StringComparison.OrdinalIgnoreCase))
+            return null;
+        var parts = new List<string>();
+        if (Text(payload, "message") is { } message) parts.Add(message);
+        if (payload.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var part in content.EnumerateArray().Take(32))
+                if (part.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(part.GetString()))
+                    parts.Add(part.GetString()!);
+                else if (part.ValueKind == JsonValueKind.Object && Text(part, "text") is { } text)
+                    parts.Add(text);
+        }
+        var complete = string.Join('\n', parts).Trim();
+        if (complete.Length == 0) return null;
+        return JsonSerializer.SerializeToElement(new
+        {
+            type = "agentMessage",
+            id = Text(payload, "id") ?? $"external-agent-{Guid.NewGuid():N}",
+            text = BoundText(complete, 256 * 1024),
+            phase = Text(payload, "phase"),
+            createdAt = UnixSeconds(observedAt)
+        });
+    }
+
+    private static JsonElement? ProjectPatchItem(JsonElement payload, DateTimeOffset? observedAt)
+    {
+        var callId = Text(payload, "call_id");
+        if (string.IsNullOrWhiteSpace(callId)) return null;
+        var changes = new List<object>();
+        if (payload.TryGetProperty("changes", out var source))
+        {
+            if (source.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var change in source.EnumerateObject().Take(12))
+                    changes.Add(new
+                    {
+                        path = BoundText(change.Name, 2_048),
+                        kind = change.Value.ValueKind == JsonValueKind.String
+                            ? change.Value.GetString()
+                            : Text(change.Value, "kind") ?? Text(change.Value, "type")
+                    });
+            }
+            else if (source.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var change in source.EnumerateArray().Take(12))
+                    if (Text(change, "path") is { } path)
+                        changes.Add(new { path = BoundText(path, 2_048), kind = Text(change, "kind") ?? Text(change, "type") });
+            }
+        }
+        return JsonSerializer.SerializeToElement(new
+        {
+            type = "fileChange",
+            id = callId,
+            callId,
+            status = Text(payload, "status") ?? (payload.TryGetProperty("success", out var success) && success.ValueKind == JsonValueKind.False ? "failed" : "completed"),
+            changes = changes.ToArray(),
+            createdAt = UnixSeconds(observedAt),
+            updatedAt = UnixSeconds(observedAt)
+        });
+    }
+
+    private static JsonElement? ProjectMcpItem(JsonElement payload, DateTimeOffset? observedAt)
+    {
+        var callId = Text(payload, "call_id");
+        if (string.IsNullOrWhiteSpace(callId) ||
+            !payload.TryGetProperty("invocation", out var invocation) ||
+            invocation.ValueKind != JsonValueKind.Object) return null;
+        var failed = payload.TryGetProperty("result", out var result) &&
+                     result.ValueKind == JsonValueKind.Object &&
+                     (result.TryGetProperty("Err", out _) || result.TryGetProperty("error", out _));
+        return JsonSerializer.SerializeToElement(new
+        {
+            type = "mcpToolCall",
+            id = callId,
+            callId,
+            status = failed ? "failed" : "completed",
+            server = Text(invocation, "server"),
+            tool = Text(invocation, "tool"),
+            createdAt = UnixSeconds(observedAt),
+            updatedAt = UnixSeconds(observedAt)
+        });
+    }
+
+    private static string ProcessType(string name) => name switch
+    {
+        "exec" or "shell_command" => "commandExecution",
+        "apply_patch" => "fileChange",
+        "spawn_agent" or "followup_task" or "send_message" or "wait_agent" or "wait" or "list_agents" => "collabAgentToolCall",
+        "view_image" or "imagegen" => "imageView",
+        "web" or "web__run" or "search" => "webSearch",
+        _ when name.Contains("browser", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("computer", StringComparison.OrdinalIgnoreCase) => "computerToolCall",
+        _ => "dynamicToolCall"
+    };
+
+    private static JsonElement ProcessItem(
+        string callId,
+        string type,
+        string name,
+        string status,
+        DateTimeOffset? createdAt,
+        DateTimeOffset? updatedAt = null) =>
+        JsonSerializer.SerializeToElement(new
+        {
+            type,
+            id = callId,
+            callId,
+            status,
+            name = BoundText(name, 128),
+            createdAt = UnixSeconds(createdAt),
+            updatedAt = UnixSeconds(updatedAt)
+        });
+
+    private static string BoundText(string value, int maximum) =>
+        value.Length <= maximum ? value : value[..maximum];
+
+    private static long? UnixSeconds(DateTimeOffset? value) => value?.ToUnixTimeSeconds();
+
+    internal static string? ResponseTurnId(JsonElement payload)
+    {
+        if (Text(payload, "turn_id") is { } direct) return direct;
+        return payload.TryGetProperty("internal_chat_message_metadata_passthrough", out var metadata) &&
+               metadata.ValueKind == JsonValueKind.Object
+            ? Text(metadata, "turn_id")
+            : null;
+    }
+
+    private void PublishUnresolved(FileTailState state, ScanBatch batch)
+    {
+        // A rollout keeps the originator from thread creation. If this bridge
+        // later resumes that Desktop-created thread, its own turn must not be
+        // announced as an external Desktop request.
+        if (_runtimeStates.IsCurrentBridgeOwnedTurn(state.ThreadId, state.ActiveTurnId)) return;
         foreach (var call in batch.UnresolvedCalls)
-            _notifications.PublishDesktopInputRequired(threadId, call.Key, call.Value);
+            _notifications.PublishDesktopInputRequired(state.ThreadId, call.Key, call.Value);
+    }
+
+    private void PublishLive(FileTailState state, ScanBatch batch)
+    {
+        // The rollout belongs to another Codex process, but its append-only tail
+        // is still the most accurate source for the small progress rows shown on
+        // the phone. Only compact projections created below enter the live store.
+        foreach (var activity in batch.LiveEvents)
+        {
+            if (activity.Item is { } item)
+                _liveEvents.ObserveExternalItem(state.ThreadId, activity.TurnId, item, activity.ObservedAt);
+            else
+                _liveEvents.ObserveExternalTurn(
+                    state.ThreadId, activity.TurnId, activity.Status ?? "inProgress", activity.ObservedAt);
+        }
     }
 
     private void PublishRuntime(FileTailState state)
@@ -619,6 +852,9 @@ public sealed class ExternalRolloutMonitor : BackgroundService
 
     private sealed class FileTailState
     {
+        private readonly Dictionary<string, ExternalProcessCall> _processCalls = new(StringComparer.Ordinal);
+        private readonly Queue<string> _processOrder = new();
+
         public FileTailState(string threadId, long offset, bool discardUntilNewline, bool isDesktopOwned)
         {
             ThreadId = threadId;
@@ -649,13 +885,74 @@ public sealed class ExternalRolloutMonitor : BackgroundService
                 ActiveTurnId = string.IsNullOrWhiteSpace(turnId) ? ActiveTurnId : turnId;
                 UnresolvedCalls.Clear();
                 CallOrder.Clear();
+                _processCalls.Clear();
+                _processOrder.Clear();
             }
             else
             {
                 ActiveTurnId = null;
                 UnresolvedCalls.Clear();
                 CallOrder.Clear();
+                _processCalls.Clear();
+                _processOrder.Clear();
             }
+        }
+
+        public void AssumeActiveTurn(string turnId, DateTimeOffset? observedAt)
+        {
+            if (string.IsNullOrWhiteSpace(turnId)) return;
+            if (!string.Equals(ActiveTurnId, turnId, StringComparison.Ordinal))
+            {
+                _processCalls.Clear();
+                _processOrder.Clear();
+            }
+            ActiveTurnId = turnId;
+            LifecycleType = "task_started";
+            RuntimeObservedAt = observedAt ?? DateTimeOffset.UtcNow;
+        }
+
+        public JsonElement RememberProcess(
+            string callId,
+            string type,
+            string name,
+            DateTimeOffset? createdAt)
+        {
+            if (!_processCalls.ContainsKey(callId))
+            {
+                _processCalls[callId] = new ExternalProcessCall(type, name, createdAt);
+                _processOrder.Enqueue(callId);
+                while (_processOrder.Count > MaximumCallsPerBatch)
+                    _processCalls.Remove(_processOrder.Dequeue());
+            }
+            var process = _processCalls[callId];
+            return ProcessItem(callId, type, name, "inProgress", process.CreatedAt);
+        }
+
+        public JsonElement CompleteProcess(string callId, DateTimeOffset? completedAt)
+        {
+            var process = _processCalls.TryGetValue(callId, out var tracked)
+                ? tracked
+                : new ExternalProcessCall("dynamicToolCall", "tool", completedAt);
+            _processCalls.Remove(callId);
+            return ProcessItem(
+                callId, process.Type, process.Name, "completed", process.CreatedAt, completedAt);
+        }
+
+        public IReadOnlyList<JsonElement> CompleteProcesses(DateTimeOffset? completedAt)
+        {
+            if (_processCalls.Count == 0) return Array.Empty<JsonElement>();
+            var completed = _processOrder
+                .Where(_processCalls.ContainsKey)
+                .Select(callId =>
+                {
+                    var process = _processCalls[callId];
+                    return ProcessItem(
+                        callId, process.Type, process.Name, "completed", process.CreatedAt, completedAt);
+                })
+                .ToArray();
+            _processCalls.Clear();
+            _processOrder.Clear();
+            return completed;
         }
 
         public void RememberCall(string callId, DateTimeOffset? createdAt)
@@ -680,6 +977,8 @@ public sealed class ExternalRolloutMonitor : BackgroundService
             PartialLine.Clear();
             UnresolvedCalls.Clear();
             CallOrder.Clear();
+            _processCalls.Clear();
+            _processOrder.Clear();
             LifecycleType = null;
             ActiveTurnId = null;
             RuntimeObservedAt = null;
@@ -690,6 +989,7 @@ public sealed class ExternalRolloutMonitor : BackgroundService
     {
         public Dictionary<string, DateTimeOffset?> UnresolvedCalls { get; } = new(StringComparer.Ordinal);
         public Queue<string> CallOrder { get; } = new();
+        public List<ExternalLiveEvent> LiveEvents { get; } = new();
         public bool HasUnreadBytes { get; set; }
 
         public void RememberCall(string callId, DateTimeOffset? createdAt)
@@ -702,5 +1002,37 @@ public sealed class ExternalRolloutMonitor : BackgroundService
         }
 
         public void Resolve(string callId) => UnresolvedCalls.Remove(callId);
+
+        public void RememberTurn(string turnId, string status, DateTimeOffset? observedAt) =>
+            RememberLive(new ExternalLiveEvent(turnId, status, null, observedAt));
+
+        public void RememberItem(string turnId, JsonElement item, DateTimeOffset? observedAt) =>
+            RememberLive(new ExternalLiveEvent(turnId, null, item.Clone(), observedAt));
+
+        private void RememberLive(ExternalLiveEvent activity)
+        {
+            LiveEvents.Add(activity);
+            while (LiveEvents.Count(IsDiscardableProcessEvent) > MaximumProcessItemsPerLiveBatch)
+            {
+                var index = LiveEvents.FindIndex(IsDiscardableProcessEvent);
+                if (index < 0) break;
+                LiveEvents.RemoveAt(index);
+            }
+        }
+
+        private static bool IsDiscardableProcessEvent(ExternalLiveEvent activity)
+        {
+            if (activity.Item is not { } item || item.ValueKind != JsonValueKind.Object) return false;
+            var type = Text(item, "type");
+            return type is not "userMessage" and not "agentMessage";
+        }
     }
+
+    private const int MaximumProcessItemsPerLiveBatch = 256;
+    private sealed record ExternalProcessCall(string Type, string Name, DateTimeOffset? CreatedAt);
+    private sealed record ExternalLiveEvent(
+        string TurnId,
+        string? Status,
+        JsonElement? Item,
+        DateTimeOffset? ObservedAt);
 }

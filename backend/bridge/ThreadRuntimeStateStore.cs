@@ -30,6 +30,11 @@ public sealed class ThreadRuntimeStateStore
     // owning desktop process may have exited without writing task_complete.
     private static readonly TimeSpan ExternalRunningLifetime = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan ExternalWaitingLifetime = TimeSpan.FromHours(2);
+    // File activity alone is only a short lease. It is used when a very large
+    // Desktop rollout no longer exposes task_started inside the bounded
+    // lifecycle scan, and only while thread/turns/list confirms the latest turn
+    // is still in progress.
+    private static readonly TimeSpan InferredExternalRunningLifetime = TimeSpan.FromMinutes(2);
     private readonly ConcurrentDictionary<string, RuntimeEvidence> _appServer = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, RuntimeEvidence> _rollout = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, DateTimeOffset> _rolloutActivity = new(StringComparer.Ordinal);
@@ -132,6 +137,7 @@ public sealed class ThreadRuntimeStateStore
     {
         var normalized = status.Trim().ToLowerInvariant();
         var failed = normalized == "failed";
+        var at = observedAt ?? DateTimeOffset.UtcNow;
         var outcome = normalized switch
         {
             "completed" => "completed",
@@ -141,13 +147,19 @@ public sealed class ThreadRuntimeStateStore
         };
         UpdateAppServer(threadId, generation, _ => new RuntimeEvidence(
             failed ? "error" : "idle", false, turnId, Array.Empty<string>(), outcome,
-            observedAt ?? DateTimeOffset.UtcNow, generation));
+            at, generation));
+        // A direct app-server completion event is live protocol evidence, not a
+        // denormalized persisted status. End the matching external rollout so it
+        // cannot outrank this authoritative terminal event in Get().
+        EndMatchingRollout(threadId, turnId, outcome, at);
     }
 
     /// <summary>
-    /// Reconciles best-effort live observations with the authoritative latest
-    /// persisted turn. A terminal latest turn must end an orphaned rollout even
-    /// when Desktop did not append its final lifecycle event.
+    /// Reconciles best-effort live observations with the latest persisted turn.
+    /// A timestamped terminal turn ends an orphaned rollout even when Desktop did
+    /// not append its final lifecycle event. An untimestamped terminal record is
+    /// weaker than a fresh, matching Desktop rollout because the persisted index
+    /// can transiently report interrupted while that turn is still producing data.
     /// </summary>
     public void ObservePersistedTurn(
         string threadId,
@@ -176,8 +188,12 @@ public sealed class ThreadRuntimeStateStore
             "cancelled" or "canceled" => "interrupted",
             _ => normalized
         };
-        // Fetch time is not event time. Without completedAt, a terminal result
-        // may end only the same turn; it must not outrank a newer live turn.
+        // Fetch time is not event time. A terminal record without completedAt
+        // must not end the same turn while fresh Desktop rollout evidence still
+        // says it is running. A direct app-server turn/completed notification is
+        // handled by ObserveTurnCompleted and remains authoritative.
+        if (!completedAt.HasValue && HasFreshMatchingRollout(threadId, turnId)) return;
+
         var at = completedAt ?? DateTimeOffset.MinValue;
         var evidence = new RuntimeEvidence(
             outcome == "failed" ? "error" : "idle",
@@ -299,11 +315,43 @@ public sealed class ThreadRuntimeStateStore
             appServer = null;
         _rollout.TryGetValue(threadId, out var rollout);
         _history.TryGetValue(threadId, out var history);
+        if (rollout is null &&
+            history is { IsRunning: null, ActiveTurnId.Length: > 0 } &&
+            _rolloutActivity.TryGetValue(threadId, out var activityAt) &&
+            DateTimeOffset.UtcNow <= activityAt + InferredExternalRunningLifetime)
+        {
+            rollout = new RuntimeEvidence(
+                "running",
+                true,
+                history.ActiveTurnId,
+                Array.Empty<string>(),
+                null,
+                activityAt,
+                0,
+                InferredFromActivity: true);
+        }
         RuntimeEvidence? selected;
         var source = "appServer";
         var canControl = true;
         var rolloutIsFreshAndActive = rollout?.IsRunning == true && IsFreshRollout(threadId, rollout);
-        if (rolloutIsFreshAndActive || appServer is null || rollout is not null && rollout.ObservedAt > appServer.ObservedAt)
+        var appServerHasKnownTurn = appServer?.ActiveTurnId is { Length: > 0 };
+        var matchingAppServerTurn = appServerHasKnownTurn &&
+                                    rollout?.ActiveTurnId is { Length: > 0 } &&
+                                    string.Equals(appServer!.ActiveTurnId, rollout.ActiveTurnId, StringComparison.Ordinal);
+        var appServerOwnsRunningTurn = appServerHasKnownTurn && appServer!.IsRunning == true;
+
+        // The rollout originator describes who created the thread, not who owns
+        // every later turn. A Desktop-created thread can be resumed by this
+        // app-server, so a matching current-generation turn/started observation
+        // is authoritative and remains controllable from the phone. A direct
+        // turn/completed observation for the same turn also wins over a delayed
+        // task_started tail record, preventing a completed bridge turn from
+        // being resurrected as an externally-owned active turn.
+        if (matchingAppServerTurn || appServerOwnsRunningTurn && !rolloutIsFreshAndActive)
+        {
+            selected = appServer;
+        }
+        else if (rolloutIsFreshAndActive || appServer is null || rollout is not null && rollout.ObservedAt > appServer.ObservedAt)
         {
             selected = rollout;
             source = "rollout";
@@ -311,8 +359,15 @@ public sealed class ThreadRuntimeStateStore
         }
         else selected = appServer;
 
+        var selectedIsFreshRunningRollout = source == "rollout" &&
+                                            selected?.IsRunning == true &&
+                                            rolloutIsFreshAndActive;
+        var historyMatchesSelected = selected is not null &&
+                                     history?.ActiveTurnId == selected.ActiveTurnId;
         if (history?.IsRunning == false &&
-            (selected is null || history.ActiveTurnId == selected.ActiveTurnId || history.ObservedAt >= selected.ObservedAt))
+            (selected is null ||
+             history.ObservedAt >= selected.ObservedAt ||
+             historyMatchesSelected && !selectedIsFreshRunningRollout))
         {
             selected = history;
             source = "history";
@@ -357,6 +412,16 @@ public sealed class ThreadRuntimeStateStore
     public bool IsExternallyOwnedActive(string threadId) =>
         Get(threadId) is { Source: "rollout", IsRunning: true, CanControl: false, Stale: false };
 
+    public bool IsCurrentBridgeOwnedTurn(string threadId, string? turnId)
+    {
+        if (string.IsNullOrWhiteSpace(threadId) || string.IsNullOrWhiteSpace(turnId) ||
+            !_appServer.TryGetValue(threadId, out var evidence) ||
+            evidence.Generation != Volatile.Read(ref _generation) ||
+            evidence.IsRunning != true)
+            return false;
+        return string.Equals(evidence.ActiveTurnId, turnId, StringComparison.Ordinal);
+    }
+
     public IReadOnlyDictionary<string, ThreadRuntimeSnapshot> Snapshot()
     {
         var ids = _appServer.Keys.Concat(_rollout.Keys).Concat(_history.Keys).Distinct(StringComparer.Ordinal);
@@ -398,7 +463,9 @@ public sealed class ThreadRuntimeStateStore
 
     private DateTimeOffset RolloutFreshUntil(string threadId, RuntimeEvidence evidence)
     {
-        var lifetime = evidence.Phase.StartsWith("waiting", StringComparison.Ordinal)
+        var lifetime = evidence.InferredFromActivity
+            ? InferredExternalRunningLifetime
+            : evidence.Phase.StartsWith("waiting", StringComparison.Ordinal)
             ? ExternalWaitingLifetime
             : ExternalRunningLifetime;
         return RolloutFreshnessAt(threadId, evidence) + lifetime;
@@ -406,6 +473,12 @@ public sealed class ThreadRuntimeStateStore
 
     private bool IsFreshRollout(string threadId, RuntimeEvidence evidence) =>
         DateTimeOffset.UtcNow <= RolloutFreshUntil(threadId, evidence);
+
+    private bool HasFreshMatchingRollout(string threadId, string turnId) =>
+        _rollout.TryGetValue(threadId, out var rollout) &&
+        rollout.IsRunning == true &&
+        string.Equals(rollout.ActiveTurnId, turnId, StringComparison.Ordinal) &&
+        IsFreshRollout(threadId, rollout);
 
     private void UpdateAppServer(
         string threadId,
@@ -476,7 +549,11 @@ public sealed class ThreadRuntimeStateStore
 
     private static DateTimeOffset? UnixTimestamp(JsonElement element, string property)
     {
-        if (!element.TryGetProperty(property, out var timestamp) || !timestamp.TryGetInt64(out var seconds) || seconds <= 0)
+        if (element.ValueKind != JsonValueKind.Object ||
+            !element.TryGetProperty(property, out var timestamp) ||
+            timestamp.ValueKind != JsonValueKind.Number ||
+            !timestamp.TryGetInt64(out var seconds) ||
+            seconds <= 0)
             return null;
         try { return DateTimeOffset.FromUnixTimeSeconds(seconds); }
         catch (ArgumentOutOfRangeException) { return null; }
@@ -489,5 +566,6 @@ public sealed class ThreadRuntimeStateStore
         string[] ActiveFlags,
         string? LastOutcome,
         DateTimeOffset ObservedAt,
-        long Generation);
+        long Generation,
+        bool InferredFromActivity = false);
 }

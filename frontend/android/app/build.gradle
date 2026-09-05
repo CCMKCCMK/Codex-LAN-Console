@@ -14,8 +14,8 @@ android {
         applicationId 'local.codex.lanconsole'
         minSdk 26
         targetSdk 36
-        versionCode 8
-        versionName '1.6.0'
+        versionCode 21
+        versionName '1.9.0'
     }
 
     signingConfigs {

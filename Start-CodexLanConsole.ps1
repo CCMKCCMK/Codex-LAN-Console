@@ -1,16 +1,21 @@
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$exe = @(
-    (Join-Path $root 'release\WindowsBridge\CodexLanBridge.exe')
-    (Join-Path $root 'WindowsBridge\CodexLanBridge.exe')
-    (Join-Path $root 'backend\bridge\bin\Release\net8.0\CodexLanBridge.exe')
-) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+$dataDirectory = Join-Path $env:LOCALAPPDATA 'CodexLanConsole'
+$rootFile = Join-Path $dataDirectory 'install-root.txt'
+if (-not (Test-Path -LiteralPath $rootFile)) { throw "Current installation marker was not found: $rootFile" }
+$root = [IO.File]::ReadAllText($rootFile).Trim()
+$currentExecutableFile = Join-Path $dataDirectory 'current-executable.txt'
+if (-not (Test-Path -LiteralPath $currentExecutableFile)) { throw "Current executable pointer was not found: $currentExecutableFile" }
+$exe = [IO.File]::ReadAllText($currentExecutableFile).Trim()
 if (-not $exe -or -not (Test-Path -LiteralPath $exe)) {
     throw "Bridge executable was not found under: $root"
 }
-$running = Get-Process -Name 'CodexLanBridge' -ErrorAction SilentlyContinue
-if (-not $running) {
-    Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe) -WindowStyle Hidden
+Remove-Item -LiteralPath (Join-Path $dataDirectory 'manual-stop.flag') -Force -ErrorAction SilentlyContinue
+$taskName = 'Codex LAN Console'
+$task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if (-not $task) { throw "Always-on task is missing. Run Install-Autostart.ps1 first." }
+Enable-ScheduledTask -TaskName $taskName | Out-Null
+if (-not (Get-Process -Name 'CodexLanBridge' -ErrorAction SilentlyContinue)) {
+    Start-ScheduledTask -TaskName $taskName
     Start-Sleep -Seconds 2
 }
 $tailscale = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |

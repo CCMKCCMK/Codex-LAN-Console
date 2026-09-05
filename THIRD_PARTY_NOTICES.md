@@ -60,6 +60,17 @@ XcodeGen is used as an MIT-licensed build-time dependency in the current iOS
 workflow. GitHub Actions and Android Gradle Plugin versions must also be recorded
 in the build dependency inventory even when they are not shipped in the app.
 
+## Commute maps and elevation
+
+- Leaflet 1.9.4: BSD-2-Clause, vendored under frontend/web/commute/vendor.
+  Its LICENSE file is retained beside the code.
+- OpenStreetMap contributors: map data under ODbL; attribution is shown in maps.
+- CARTO: basemap tiles, attribution retained. Follow provider usage terms.
+- Open-Meteo elevation: Copernicus GLO-90 data attribution displayed. The free
+  API is non-commercial; arrange appropriate access for commercial deployment.
+- UCSD OneBusAway / Wayfinder: remote transit and routing services, not bundled
+  datasets. Availability and routing coverage are controlled by the provider.
+
 ## Maintenance rule
 
 Before adding, updating, vendoring, or redistributing a dependency:

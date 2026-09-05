@@ -1,6 +1,27 @@
-# Codex LAN Console 1.6.0
+# Codex LAN Console 1.9.0
+
+独立开发的手机远程工作台：任务、浏览器操作、通勤与 Scooter 续航记录。
+MIT 开源预览版，不是 OpenAI 或 UCSD 的官方产品。运行中的 Bridge 仍应
+只在你的私有网络内访问，不要把控制端口暴露到公网。
+
+## 1.9.0：Scooter 续航实验
+
+- 通勤 → Scooter：已充满、开始骑行、停止骑行、已没电。
+- 按充电周期累计实际里程、使用时间、爬升与下降，展示历史与数据导出。
+- Android 用户主动启动的前台定位服务支持后台记录、断网暂存、重传去重。
+- 结合地图地形与真实返程路线，估算能否到达设置的充电点并留出安全余量。
+- 至少 3 个合格完整周期后开始初步容量校准；明确显示样本与历史预测误差。
+  这不是读取车载电池百分比，也不保证两三周就能达到特定准确率。
+- 通勤与 Console 统一导航风格；异步任务刷新不会抢走通勤页面。
+
+详细说明、权限与数据边界见 [Scooter 使用说明](docs/SCOOTER.md)。
+Android 后台定位需安装 1.9.0 APK；旧 APK 与 iOS 只能使用 Web 端已有能力。
 
 Codex LAN Console 用安卓手机或 iPhone 查看和控制这台 Windows 电脑上已经登录的 Codex/ChatGPT 编程环境。手机端不需要再登录 OpenAI、Google 或 Microsoft 账号。
+
+1.6.2 新增同源额度小组件：安卓桌面可添加固定 2x2、完全透明背景的“Codex 额度”组件；Windows 启动 Bridge 后也会显示同尺寸的透明桌面组件。两端都显示剩余额度、当前百分比消耗速度、重置时间，以及“近期、稳健、整窗平均”三种预计可用时间。数据直接来自本机已登录的 Codex，不需要再登录账号。
+
+1.6.3 将 Windows 小组件改为真正的桌面组件，并修复手机读取远程交付文件：窗口挂载到 Explorer 桌面层，按 `Win+D` 或点击“显示桌面”不会把它隐藏；同一任务的 Codex 验收截图和可信交付物现在可直接预览、打开、下载及失败后重试，同时继续禁止跨任务和任意电脑路径读取。手机断线后，已经由 Bridge 接收的新建任务或指令仍由电脑端继续完成；自动续接只会在 Codex 确认收到替代指令后撤销。
 
 ## 仓库结构
 
@@ -20,9 +41,44 @@ Web 前端在构建时复制进 Windows Bridge 的 `wwwroot`，所以最终用�
 
 ## 项目状态与许可
 
-本仓库目前是私有预发布项目，原创代码保留全部权利，只允许获得授权的测试者按 [`BETA_EULA.md`](BETA_EULA.md) 进行测试；第三方组件仍按各自许可证使用，详见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。正式公开前会完成独立品牌、安全审计与许可证决策，检查项见 [`docs/PUBLIC_RELEASE_CHECKLIST.md`](docs/PUBLIC_RELEASE_CHECKLIST.md)。
+原创代码使用 [MIT License](LICENSE)，欢迎查看、修改和贡献。第三方组件仍按各自许可证使用，详见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。这是实验性开源预览，尚未完成独立安全审计与全面真机测试；边界见 [`docs/PUBLIC_RELEASE_CHECKLIST.md`](docs/PUBLIC_RELEASE_CHECKLIST.md)。
 
 本项目是独立开发的软件，不隶属于 OpenAI 或 UC San Diego，也未得到其赞助或认可。使用前请阅读 [`SECURITY.md`](SECURITY.md)、[`PRIVACY.md`](PRIVACY.md) 与 [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)。
+
+## 1.7.3 的主要改进
+
+- 管理员模式不再限制为一台设备。桌面管理器可反复开启 10 分钟的新增设备窗口；现有设备始终保留，成功加入一台后窗口自动关闭。
+- 编辑区新增真实模型与思考深度选择。列表来自本机 Codex，选择会随持久队列保存，并真正用于新的 `turn/start`；活动轮次不会被伪装成已经切换模型。
+- 模型目录会按当前账户动态显示，并只提供对应模型实际支持的思考深度；目录暂时不可用时才回退到兼容选项。
+
+## 1.7.1 的主要改进
+
+- 手机发送的指令会先保存到电脑端队列，再交给 Codex；Bridge 重连不会丢失尚未送出的指令，也不会盲目重复已经送出的操作。
+- 任务详情改为消息和工具步骤的增量更新。用户正在滑动或阅读旧消息时，页面不再被刷新强行向下拖；只有本来就在底部时才跟随新消息。
+- 实时消息、工具步骤和最终结论会连续展示，工具详情默认折叠；后台读取失败时保留现有内容并自动恢复。
+- 手机可直接下载任务交付的公共 CA 证书文件，同时继续禁止下载私钥文件。
+
+## 1.7.0 的主要改进
+
+### Windows 管理员模式
+
+- 默认仍以普通 Windows 用户权限运行。需要远程安装程序、修改防火墙等管理员操作时，可在桌面唯一的 BAT 管理程序中选择 `7`，再选择“启用管理员模式”。第一次启用必须在电脑上确认一次 Windows UAC；之后由 Bridge 新建或手机发起的新任务会继承该管理员令牌，不会为同类命令反复弹出 UAC。
+- 高权限 Bridge 不从用户可写的项目目录运行。启用过程会对复制前后的发布文件做哈希一致性检查，再放入受 ACL 保护的 `%ProgramFiles%\Codex LAN Console\Bridge\<version>`，然后才把 Windows 常驻任务切换为 `Highest`；同时创建仅允许 Tailscale IPv4 范围访问 TCP 8787 的专用防火墙规则。
+- 管理员模式使用独立的受保护配对库；普通模式已有的手机令牌不能直接获得管理员权限。首次配对或在电脑本地选择“添加另一台管理员手机”后，会开放一个 10 分钟窗口，成功加入一台即关闭，已经配对的设备不会失效。远程监听也会收紧为本机回环地址和当前 Tailscale IPv4，不再监听普通局域网或通配地址。启动时若 Tailscale 尚未就绪，Bridge 会退出并由常驻任务重试，不会悄悄变成只能本机访问的状态。
+- 管理员模式不会关闭 UAC、修改安全桌面或远程模拟 UAC 点击。SmartScreen、Windows Hello、凭据输入、驱动安装等特殊系统界面仍可能要求在电脑上处理。
+- 已经由桌面 Codex 启动的旧轮次不会被中途提权。请从手机新建任务，或等旧轮次结束后从手机继续，使整轮工作从一开始就由高权限 Bridge 持有。
+
+配对后的手机在管理员模式下等同于一个远程管理员入口，而且 Codex、项目脚本及其调用的工具都会以管理员权限执行。当前私人构建尚未使用 Authenticode 发布者签名，第一次 UAC 确认信任的是这台电脑上现有的本地脚本和发布副本；它的哈希检查只能发现复制损坏，不能证明发布者身份。只应从可信本地副本启用，并在受控 Tailscale 网络和可信手机上使用；不需要时，应通过同一 BAT 恢复普通模式。完整边界见 [`docs/ADMINISTRATOR_MODE_SECURITY.md`](docs/ADMINISTRATOR_MODE_SECURITY.md)。
+
+## 1.6.1 的主要改进
+
+### 终端弹窗来源审计
+
+- “进程”页升级为“进程与弹窗诊断”。Windows Bridge 会在内存中记录短暂出现的 CMD、PowerShell 和 Windows Terminal 窗口，而不是简单隐藏窗口。
+- 每条记录会显示首次和最近出现时间、次数、平均周期、真正的启动来源、命令进程、窗口宿主、父子进程链、可执行文件路径及脱敏后的命令摘要。
+- 已知的 ChatGPT 周期性资源查询会明确说明“ChatGPT 是启动源，Windows Terminal 只是窗口宿主”，避免误杀 Terminal。
+- 可随时暂停、继续或清空记录；停止已识别来源时仍要求输入精确的 `STOP <PID>`，不会因为一次误判自动结束进程。
+- 该诊断只在打开“进程”页或手动刷新时传到手机，不进入概览页的高频轮询。已有 1.6.0 Android/iOS 客户端可直接使用新界面，不需要重新安装 App。
 
 ## 1.6.0 的主要改进
 
@@ -96,7 +152,7 @@ Bridge 与 ChatGPT Desktop 仍是两个独立 app-server 连接。JSON-RPC 请�
 
 ### 如何开启
 
-1. 覆盖安装 `Codex-LAN-Console-v1.6.0.apk`，然后打开手机 App。
+1. 覆盖安装 `Codex-LAN-Console-v1.7.3.apk`，然后打开手机 App。
 2. 在“概览”页点击“开启通知”，并允许 Android 发送通知。
 3. 点击“试一下”验证声音和震动。小米/Redmi 如提示后台限制，再点击“后台设置”允许持续运行。
 
@@ -147,31 +203,33 @@ Bridge 与 ChatGPT Desktop 仍是两个独立 app-server 连接。JSON-RPC 请�
 
 ## 发布文件
 
-- 源码目录中的 Windows 桥接端：`release\WindowsBridge\CodexLanBridge.exe`
-- 解压发布包后的 Windows 桥接端：`WindowsBridge\CodexLanBridge.exe`
-- 安卓 App：`Codex-LAN-Console-v1.6.0.apk`
-- iOS 真机包：GitHub Actions 生成的 `Codex-LAN-Console-iOS-v1.6.0-unsigned.ipa`（必须自行签名）
-- iOS 模拟器包：GitHub Actions 生成的 `Codex-LAN-Console-iOS-v1.6.0-simulator-unsigned.zip`
-- iOS 自行签名源码：`Codex-LAN-Console-iOS-v1.6.0-source.zip`（推荐在 Mac 上解压后按 `frontend/ios/README.md` 用自己的 Team 构建）
+- 当前 Windows 桥接端：`release\WindowsBridge-1.7.7\CodexLanBridge.exe`
+- `%LOCALAPPDATA%\CodexLanConsole\current-executable.txt` 记录普通模式和回退使用的仓库发布版；管理员模式的实际任务路径固定在受保护的 `%ProgramFiles%\Codex LAN Console\Bridge\<version>`。
+- 安卓 App：`Codex-LAN-Console-v1.7.3.apk`
+- iOS 真机包：当前已生成的 `Codex-LAN-Console-iOS-v1.5.0-unsigned.ipa`（必须自行签名）
+- iOS 模拟器包：`Codex-LAN-Console-iOS-v1.5.0-simulator-unsigned.zip`
+- iOS 自行签名源码：`Codex-LAN-Console-iOS-v1.5.0-source.zip`（推荐在 Mac 上解压后按 `frontend/ios/README.md` 用自己的 Team 构建）
 - 本地端口：TCP 8787
-- 配对数据、通知事件和上传文件：`%LOCALAPPDATA%\CodexLanConsole`
+- 配对数据、通知事件、额度百分比历史和上传文件：`%LOCALAPPDATA%\CodexLanConsole`
 - 安卓要求：Android 8.0 或更高版本
 - iOS 要求：iOS 16 或更高版本
 
 ## 使用唯一的 BAT 管理程序
 
-日常只使用桌面的 `Codex LAN Console 开关.bat`。桥接端按需运行，不需要随 Windows 自动启动。
+日常只使用桌面的 `Codex LAN Console 开关.bat`。安装常驻任务后，桥接端会随登录自动启动；异常退出时由 Windows 自动恢复。
 
-1. 选择 `1` 启动桥接端。
+1. 选择 `1` 启动桥接端，并恢复常驻任务。
 2. 选择 `3` 查看当前六位配对码、Tailscale 地址和局域网地址。
-3. 不再需要远程访问时，选择 `2` 停止桥接端。
+3. 只有明确选择 `2` 才会同时停止桥接端并暂停自动恢复；再次选择 `1` 即可恢复。
 4. 选择 `4` 刷新状态。
+5. 小组件显示异常时选择 `5`，程序会执行一次受控重启并保持常驻。
+6. 需要远程执行管理员操作时选择 `7`；启用和关闭都要求明确确认，第一次启用还要在电脑上通过一次 UAC。要增加另一台可信手机，在该菜单选择 `3` 并输入 `ADD`；现有手机保持有效，新配对码只开放 10 分钟且成功使用一次后立即关闭。
 
-需要在终端快速检查时，可以运行 `Codex-LAN-Toggle.bat status`。管理程序在源码目录中会优先使用 `release\WindowsBridge`，在解压后的发布包中会使用 `WindowsBridge`。
+需要在终端快速检查时，可以运行 `Codex-LAN-Toggle.bat status`。管理程序与常驻安装脚本都读取 `current-executable.txt`；首次安装时会选择 `release` 下版本号最高的 `WindowsBridge-*` 目录。
 
 ## 通过局域网或 Tailscale 连接
 
-手机和电脑连接同一可信 Wi-Fi 或有线局域网时，使用 BAT 管理程序显示的局域网地址，例如 `http://192.168.x.x:8787`。
+普通模式下，手机和电脑连接同一可信 Wi-Fi 或有线局域网时，可使用 BAT 管理程序显示的局域网地址，例如 `http://192.168.x.x:8787`。管理员模式不会监听普通局域网地址，只接受本机和 Tailscale 连接。
 
 需要在外网访问时，应在 Windows 和安卓上分别安装 Tailscale，并让两台设备加入同一个 tailnet，然后使用管理程序显示的 `http://100.x.x.x:8787` 地址。Tailscale 不内置在 APK 中，因此可以独立更新和管理。
 
@@ -183,7 +241,7 @@ Bridge 与 ChatGPT Desktop 仍是两个独立 app-server 连接。JSON-RPC 请�
 
 ## 安装或升级安卓 App
 
-1. 把 `Codex-LAN-Console-v1.6.0.apk` 传到手机；已经配对的旧版本也可以直接下载这个 APK。
+1. 把 `Codex-LAN-Console-v1.7.3.apk` 传到手机；已经配对的旧版本可直接覆盖安装。
 2. 打开 APK，并在安卓提示时只允许从当前来源安装。
 3. 打开 Codex LAN Console，输入 BAT 管理程序显示的一个地址。
 4. 输入当前六位配对码。
@@ -219,8 +277,9 @@ iOS 项目需要 macOS、Xcode 16 和 XcodeGen；Windows 上提交源码后，�
 - **手机无法连接：** 确认 BAT 管理程序显示 `RUNNING`。使用 Tailscale 时，确认两台设备在同一个 tailnet 中在线；使用局域网时，确认手机和电脑位于同一个可信网络。
 - **后台不提醒：** 先在概览页确认状态为“后台运行中”，再点击“试一下”。小米/Redmi 还应在“后台设置”中允许自启动/后台运行并将电量策略设为不限制。强行停止 App 后 Android 不允许它自行恢复，需重新打开一次。
 - **Computer Use 仍然询问：** 先确认当前任务使用“完全自主”，或开启“自动批准”。Bridge 会自动处理普通审批和 Computer Use 的独立 MCP 工具授权；普通业务问题仍会在手机等待你的答案。
+- **管理员命令仍弹出 UAC：** “完全自主”只控制 Codex 审批，不等于 Windows 管理员令牌。请在桌面 BAT 中选择 `7` 开启管理员模式，并从手机新建下一轮。第一次启用必须在电脑上确认一次 UAC；系统不会远程点击或关闭安全桌面。
 - **电脑端单独启动的活动任务：** Codex 协议把审批 request id 绑定到启动该轮的 app-server 连接，Bridge 不能对另一个进程伪造响应。要做到电脑零操作，请从手机 Console 新建任务，或等该轮结束后从手机续跑，使下一轮从开始到结束都归 Bridge 控制。
-- **看不到配对码：** 先启动桥接端，再选择 `3`。当前配对码也保存在 Windows 的 `%LOCALAPPDATA%\CodexLanConsole\pairing.txt`。
+- **看不到配对码：** 先启动桥接端，再选择 `3`。普通模式配对文件位于 `%LOCALAPPDATA%\CodexLanConsole\pairing.txt`；管理员模式会由 BAT 自动读取 `%ProgramData%` 下当前 Windows SID 对应的受保护配对文件。管理员窗口在成功配对一次或 10 分钟到期后关闭；需要增加设备时，在管理员菜单选择“添加另一台管理员手机”。
 - **文件无法上传：** 确认不超过 10 个文件、单个 128 MiB、合计 256 MiB，并在网络稳定后重试。
 - **文件卡片无法再打开：** 临时下载凭证可能已经过期。重新载入任务即可申请新的凭证。手机上传的副本最多保留 30 天。
 - **发送请求失败：** 打开错误详情，报告问题时同时保留请求 ID、操作名称和错误文字。

@@ -28,6 +28,9 @@ To provide its features, the bridge may access:
   rollout history used to detect task state and notifications;
 - project names, working-directory paths, and selected files;
 - a limited list of related local processes and their status;
+- brief console-window launch events, including process names, parent process
+  chains, executable paths, timing, and command lines used to identify the
+  program responsible for repeated terminal popups;
 - files the user uploads from a phone or explicitly registers from a task
   workspace; and
 - local development HTTP services when the user requests a temporary relay for
@@ -38,6 +41,12 @@ Console reads that history but does not promise to delete the original Codex
 session files.
 
 ## Windows bridge storage
+
+The quota widget stores a bounded history of rate-limit percentage, window key,
+reset time, and observation time in `quota-history.json`. It does not store an
+account name, email address, prompt, response, file, or raw authentication
+credential. The history is used only for local burn-rate and remaining-time
+estimation and is removed with the other bridge data.
 
 The default bridge data root is:
 
@@ -52,6 +61,7 @@ The default bridge data root is:
 | Uploaded file copies and lease registry | `Uploads\` and `Uploads\leases.json` | Uploaded copies are scheduled for deletion after 30 days. The service checks for expired data periodically. |
 | Registered workspace-file leases | Lease registry | Normally expire after 1 day. Expiration does not delete the original workspace file. An uploaded file remains leased with its managed copy for up to 30 days. |
 | Localhost relay grants | Memory only | Normally expire after 10 minutes and disappear when the bridge stops. |
+| Console-launch audit | Memory only | Bounded to the most recent aggregated events and disappears when the bridge stops. It can be paused or cleared from the Processes screen. |
 
 Registering an existing workspace file creates a temporary access lease but
 does not copy, move, or delete the original file. Upload cleanup is best effort;
@@ -62,6 +72,13 @@ The project writes operational errors to the bridge process’s standard output
 or error streams. It does not currently create a persistent log file itself,
 but the launcher, operating system, terminal, debugger, or hosting environment
 may capture that output.
+
+Console-launch command lines can contain paths, arguments, or credentials.
+The bridge therefore redacts common secret-bearing arguments before returning
+an audit record to a phone or browser. The raw observation exists only in the
+bridge process memory long enough to classify and aggregate it; it is not
+persisted by the audit service. Users should still avoid placing secrets
+directly on command lines where possible.
 
 ## Browser and mobile storage
 
@@ -77,6 +94,10 @@ the token, is encrypted with a key held by Android Keystore. The server address
 also has a private, application-only preference copy that is not encrypted.
 Android backup is disabled for the app. The data remains until the app clears
 it, app data is cleared, or the app is uninstalled.
+
+The Android quota widget also caches the last quota display payload using the
+same Android Keystore-backed encryption. It contains percentages, rates,
+estimated durations, and reset times, but no task content or account identity.
 
 When the user selects a document, Android may grant the app persistent read
 access to that provider URI. The authorization can remain until the provider or
@@ -151,6 +172,22 @@ cross-service advertising profile. If a future release adds a hosted service,
 crash reporting, analytics, push provider, or other external processor, this
 notice and the relevant app-store disclosures must be updated before that
 feature is enabled.
+
+## Scooter range experiment (1.9.0)
+
+When a user explicitly starts a ride, Android collects precise location and
+timestamps, buffers them privately on the phone, and sends them to the paired
+computer. It does not start tracking on boot. The computer stores cycle
+summaries and per-ride traces under its local Scooter directory. No automatic
+expiry is applied; export and deletion instructions are in docs/SCOOTER.md.
+Public GitHub releases and promotional videos do not contain real traces.
+
+If terrain is enabled, coordinates are sent to Open-Meteo. Return-route
+queries send origin/destination coordinates to UCSD Wayfinder. CARTO and
+OpenStreetMap serve map tiles. Disable terrain in Scooter settings if you do
+not want elevation queries; range modeling is then less complete. Stop riding
+in the UI or notification to stop collecting new points. Notifications depend
+on fresh position, network, permissions and Android background execution.
 
 ## Children
 

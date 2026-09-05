@@ -5,6 +5,9 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
@@ -41,6 +44,7 @@
             android:exported="false"
             android:foregroundServiceType="remoteMessaging"
             android:stopWithTask="false" />
+        <service android:name=".ScooterTrackingService" android:exported="false" android:foregroundServiceType="location" android:stopWithTask="false" />
         <receiver
             android:name=".NotificationBootReceiver"
             android:enabled="true"
@@ -49,6 +53,18 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
+        </receiver>
+        <receiver
+            android:name=".CodexQuotaWidgetProvider"
+            android:enabled="true"
+            android:exported="false"
+            android:label="@string/quota_widget_name">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/codex_quota_widget_info" />
         </receiver>
         <activity
             android:name=".MainActivity"

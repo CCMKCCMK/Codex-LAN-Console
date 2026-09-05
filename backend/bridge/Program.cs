@@ -3,26 +3,86 @@ using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using CodexLanBridge;
+using CodexLanBridge.Commute;
 using Microsoft.AspNetCore.Http.Features;
+
+var bridgeDataDirectory = Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+    "CodexLanConsole");
+if (args.Length == 1 && args[0].Equals("configure-administrator-code", StringComparison.OrdinalIgnoreCase))
+{
+    var administratorCode = Console.In.ReadLine()?.Trim() ?? "";
+    var storage = PairingStoragePolicy.ResolveCurrent();
+    PairingStoragePolicy.Prepare(storage);
+    var persistentCode = new PersistentAdministratorCode(storage.AdministratorCodeFile);
+    persistentCode.Configure(administratorCode, storage.AdministratorMode
+        ? file => PairingStoragePolicy.ProtectSecretFile(storage, file)
+        : null);
+    return;
+}
+var manualStopFile = Path.Combine(bridgeDataDirectory, "manual-stop.flag");
+if (OperatingSystem.IsWindows() && File.Exists(manualStopFile)) return;
+
+Mutex? singleInstanceMutex = null;
+if (OperatingSystem.IsWindows())
+{
+    singleInstanceMutex = new Mutex(true, @"Local\CodexLanConsole.Bridge", out var ownsMutex);
+    if (!ownsMutex)
+    {
+        singleInstanceMutex.Dispose();
+        return;
+    }
+}
 
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions
 {
     Args = args,
     ContentRootPath = AppContext.BaseDirectory
 });
-builder.WebHost.UseUrls(Environment.GetEnvironmentVariable("CODEX_LAN_URLS") ?? "http://0.0.0.0:8787");
+var configuredBridgeUrls = Environment.GetEnvironmentVariable("CODEX_LAN_URLS");
+var bridgeBinding = BridgeBindingPolicy.ResolveCurrent(
+    WindowsProcessElevation.Current.Active,
+    configuredBridgeUrls);
+builder.WebHost.UseUrls(bridgeBinding.UrlSetting);
 builder.Services.AddSingleton<PairingService>();
+builder.Services.AddSingleton<ApiErrorLog>();
+builder.Services.AddSingleton<AppServerDiagnosticLog>();
 builder.Services.AddSingleton<NotificationStore>();
 builder.Services.AddSingleton<ThreadRuntimeStateStore>();
 builder.Services.AddSingleton<ApprovalSettingsStore>();
+builder.Services.AddSingleton<BridgeTurnRecoveryStore>();
+builder.Services.AddSingleton<ThreadCommandOutboxStore>();
+builder.Services.AddSingleton<ThreadLiveEventStore>();
 builder.Services.AddSingleton<CodexAppServer>();
+builder.Services.AddSingleton<CodexModelCatalog>();
+builder.Services.AddSingleton<ThreadCommandOutboxDispatcher>();
 builder.Services.AddSingleton<ProjectScanner>();
 builder.Services.AddSingleton<LocalPortRelayService>();
 builder.Services.AddSingleton<FileTransferService>();
+builder.Services.AddSingleton<ConsoleLaunchAuditService>();
+builder.Services.AddSingleton<QuotaMonitorService>();
+builder.Services.AddSingleton<CpuGuardService>();
+builder.Services.AddSingleton<LocalControlTokenStore>();
+builder.Services.AddSingleton<WindowsQuotaWidgetSettingsStore>();
+builder.Services.AddSingleton<ChromeBootstrapService>();
+builder.Services.AddSingleton<CommuteStore>();
+builder.Services.AddSingleton<CommutePlanner>();
+builder.Services.AddSingleton<ScooterStore>();
+builder.Services.AddSingleton<ScooterService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ScooterService>());
+builder.Services.AddSingleton<CommuteReminderService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<CommuteReminderService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<CodexAppServer>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ThreadCommandOutboxDispatcher>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<LocalPortRelayService>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<FileTransferService>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ConsoleLaunchAuditService>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<QuotaMonitorService>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<CpuGuardService>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ChromeBootstrapService>());
+builder.Services.AddHostedService<WindowsQuotaWidgetHostedService>();
 builder.Services.AddHostedService<NotificationMonitor>();
 builder.Services.AddHostedService<ExternalRolloutMonitor>();
 builder.Services.Configure<FormOptions>(options =>
@@ -32,6 +92,7 @@ builder.Services.Configure<FormOptions>(options =>
 });
 
 var app = builder.Build();
+_ = app.Services.GetRequiredService<LocalControlTokenStore>();
 app.Use(async (context, next) =>
 {
     var suppliedRequestId = context.Request.Headers["X-Request-ID"].ToString().Trim();
@@ -52,6 +113,11 @@ app.Use(async (context, next) =>
     catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested) { }
     catch (Exception ex) when (!context.Response.HasStarted)
     {
+        context.RequestServices.GetRequiredService<ApiErrorLog>().Write(
+            requestId,
+            context.Request.Method,
+            context.Request.Path.Value ?? "",
+            ex);
         var (status, kind, message, code) = ex switch
         {
             CodexRpcException rpc when rpc.IsPolicyRestricted =>
@@ -83,9 +149,14 @@ app.UseStaticFiles();
 
 app.Use(async (context, next) =>
 {
+    var authorizedLocalCpu = context.Request.Path.StartsWithSegments("/api/local/cpu") &&
+        CpuGuardApi.IsAuthorizedLocalControl(
+            context,
+            context.RequestServices.GetRequiredService<LocalControlTokenStore>());
     if (!context.Request.Path.StartsWithSegments("/api") ||
         context.Request.Path.StartsWithSegments("/api/health") ||
-        context.Request.Path.StartsWithSegments("/api/pair"))
+        context.Request.Path.StartsWithSegments("/api/pair") ||
+        authorizedLocalCpu)
     {
         await next();
         return;
@@ -104,14 +175,99 @@ app.Use(async (context, next) =>
     await next();
 });
 
+app.MapCommute();
+app.MapScooter();
+
 app.MapGet("/api/health", (PairingService pairing, CodexAppServer codex) => new
 {
     ok = true,
     name = "Codex LAN Console",
+    version = typeof(CodexAppServer).Assembly.GetName().Version?.ToString(3) ?? "1.7.7",
     paired = pairing.HasDevices,
+    pairingOpen = pairing.IsPairingOpen,
     codex = codex.IsReady,
     machine = Environment.MachineName,
     time = DateTimeOffset.Now
+});
+
+app.MapGet("/api/quota", (QuotaMonitorService quota, HttpContext context) =>
+{
+    context.Response.Headers.CacheControl = "no-store";
+    return Results.Ok(quota.GetSnapshot());
+});
+
+app.MapGet("/api/cpu", (CpuGuardService cpu, HttpContext context) =>
+{
+    context.Response.Headers.CacheControl = "no-store";
+    return Results.Ok(cpu.GetSnapshot());
+});
+
+app.MapGet("/api/browser/status", (ChromeBootstrapService browser, HttpContext context) =>
+{
+    context.Response.Headers.CacheControl = "no-store";
+    return Results.Ok(browser.GetSnapshot());
+});
+
+app.MapPost("/api/browser/start", async (
+    ChromeBootstrapService browser,
+    IHostApplicationLifetime applicationLifetime) =>
+{
+    var snapshot = await browser.EnsureStartedAsync(
+        "手机端远程办事",
+        applicationLifetime.ApplicationStopping);
+    // A failed browser wake-up is an actionable state, not a failed phone-to-PC
+    // transport. Returning the snapshot lets the mobile UI explain and retry it.
+    return Results.Ok(snapshot);
+});
+
+app.MapPost("/api/browser/settings", (
+    BrowserSettingsRequest request,
+    ChromeBootstrapService browser) =>
+    Results.Ok(browser.SetAutoStart(request.AutoStartWithBridge)));
+
+app.MapGet("/api/local/cpu", (CpuGuardService cpu, LocalControlTokenStore localControl, HttpContext context) =>
+{
+    if (!CpuGuardApi.IsAuthorizedLocalControl(context, localControl)) return Results.NotFound();
+    context.Response.Headers.CacheControl = "no-store";
+    return Results.Ok(cpu.GetSnapshot());
+});
+
+app.MapGet("/api/local/cpu/status", (CpuGuardService cpu, LocalControlTokenStore localControl, HttpContext context) =>
+{
+    if (!CpuGuardApi.IsAuthorizedLocalControl(context, localControl)) return Results.NotFound();
+    context.Response.Headers.CacheControl = "no-store";
+    return Results.Text(CpuGuardApi.FormatStatus(cpu.GetSnapshot()), "text/plain; charset=utf-8");
+});
+
+app.MapPost("/api/local/cpu/mode/{requestedMode}", (string requestedMode, CpuGuardService cpu, LocalControlTokenStore localControl, HttpContext context) =>
+{
+    if (!CpuGuardApi.IsAuthorizedLocalControl(context, localControl)) return Results.NotFound();
+    if (!Enum.TryParse<CpuGuardMode>(requestedMode, true, out var mode) || !Enum.IsDefined(mode))
+        return Results.BadRequest(new { error = "Mode must be Off, Monitor, or AutoGuard." });
+    cpu.SetMode(mode);
+    return Results.Text($"CPU guard mode: {mode}", "text/plain; charset=utf-8");
+});
+
+app.MapPost("/api/local/cpu/repair", async (CpuGuardService cpu, LocalControlTokenStore localControl, HttpContext context) =>
+{
+    if (!CpuGuardApi.IsAuthorizedLocalControl(context, localControl)) return Results.NotFound();
+    var result = await cpu.RepairNowAsync(context.RequestAborted);
+    var details = result.Changes.Concat(result.Errors).ToArray();
+    var text = details.Length == 0
+        ? result.Message
+        : result.Message + Environment.NewLine + string.Join(Environment.NewLine, details.Select(value => "- " + value));
+    return Results.Text(text, "text/plain; charset=utf-8", statusCode: result.Applied ? 200 : 409);
+});
+
+app.MapPost("/api/local/cpu/baseline", async (CpuGuardService cpu, LocalControlTokenStore localControl, HttpContext context) =>
+{
+    if (!CpuGuardApi.IsAuthorizedLocalControl(context, localControl)) return Results.NotFound();
+    var result = await cpu.CaptureCurrentBaselineAsync(context.RequestAborted);
+    var details = result.Changes.Concat(result.Errors).ToArray();
+    var text = details.Length == 0
+        ? result.Message
+        : result.Message + Environment.NewLine + string.Join(Environment.NewLine, details.Select(value => "- " + value));
+    return Results.Text(text, "text/plain; charset=utf-8", statusCode: result.Applied ? 200 : 409);
 });
 
 app.MapPost("/api/pair", async (HttpContext context, PairingService pairing) =>
@@ -130,6 +286,12 @@ app.MapPost("/api/pair", async (HttpContext context, PairingService pairing) =>
         context.Response.Headers.RetryAfter = retryAfterSeconds.ToString();
         return Results.Json(new { error = "Too many pairing attempts. Try again shortly." }, statusCode: 429);
     }
+    if (result == PairingAttemptResult.PairingClosed)
+        return Results.Json(new
+        {
+            error = "Administrator Mode pairing is closed or its code expired. Open a time-limited pairing window from the local Windows manager.",
+            kind = "pairingClosed"
+        }, statusCode: StatusCodes.Status403Forbidden);
     if (result != PairingAttemptResult.Success)
         return Results.Json(new { error = "Invalid or expired pairing code." }, statusCode: 401);
     context.Response.Cookies.Append(PairingService.SessionCookieName, token, SessionCookie.Options(context));
@@ -170,6 +332,8 @@ app.MapGet("/api/summary", async (
     CodexAppServer codex,
     ProjectScanner projects,
     ThreadRuntimeStateStore runtimeStates,
+    ThreadCommandOutboxStore commandOutbox,
+    ChromeBootstrapService browser,
     CancellationToken cancellationToken) =>
 {
     var threads = await codex.CallAsync(
@@ -181,10 +345,15 @@ app.MapGet("/api/summary", async (
     {
         machine = Environment.MachineName,
         codexReady = codex.IsReady,
+        administratorMode = WindowsProcessElevation.Current,
+        browser = browser.GetSnapshot(),
         threads,
         projects = projects.Scan().Take(12).ToArray(),
         processes = ProcessApi.List().Take(20).ToArray(),
         pending = codex.Pending.Values.OrderByDescending(x => x.CreatedAt).ToArray(),
+        commandOutbox = commandOutbox.Snapshot(limit: 50),
+        turnRecovery = codex.RecoverySnapshot(),
+        threadAccess = codex.AccessSnapshot(),
         runtimeStates = runtimeStates.Snapshot()
     });
 });
@@ -209,6 +378,8 @@ app.MapGet("/api/threads/{id}", async (
     int? limit,
     CodexAppServer codex,
     ThreadRuntimeStateStore runtimeStates,
+    ThreadLiveEventStore liveEvents,
+    ThreadCommandOutboxStore commandOutbox,
     CancellationToken cancellationToken) =>
 {
     var pageSize = Math.Clamp(limit ?? 6, 1, 20);
@@ -233,7 +404,8 @@ app.MapGet("/api/threads/{id}", async (
             new { threadId = id, includeTurns = false },
             cancellationToken);
     }
-    catch (CodexRpcException ex) when (ApiHelpers.IsUnmaterializedThread(ex))
+    catch (CodexRpcException ex) when (ApiHelpers.IsUnmaterializedThread(ex) ||
+        ex.IsHistoryInitializing && codex.IsThreadStarting(id))
     {
         codex.TryGetKnownThreadCwd(id, out var knownCwd);
         metadata = JsonSerializer.SerializeToElement(new
@@ -260,11 +432,54 @@ app.MapGet("/api/threads/{id}", async (
             },
             cancellationToken);
         runtimeStates.ObserveLatestPersistedTurn(id, turnPage);
-        return Results.Ok(ApiHelpers.PagedThread(metadata, turnPage, id, runtimeStates.Get(id)));
+        var recovery = codex.ReconcileRecoveryWithLatestPersistedTurn(id, turnPage);
+        JsonElement recentItemsPage = default;
+        var recentItemsTurnId = string.IsNullOrWhiteSpace(cursor) ? ApiHelpers.LatestTurnId(turnPage) : null;
+        if (!string.IsNullOrWhiteSpace(recentItemsTurnId))
+        {
+            try
+            {
+                recentItemsPage = await codex.CallAsync(
+                    "thread/items/list",
+                    new
+                    {
+                        threadId = id,
+                        turnId = recentItemsTurnId,
+                        limit = 64,
+                        sortDirection = "desc"
+                    },
+                    cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception ex) when (ex is CodexRpcException or IOException)
+            {
+                // Very large, legacy, or temporarily unavailable item history must not make
+                // the entire conversation unreadable. The summary page remains a
+                // safe fallback and the next visible-page poll will try again.
+            }
+        }
+        return Results.Ok(ApiHelpers.PagedThread(
+            metadata,
+            turnPage,
+            id,
+            runtimeStates.Get(id),
+            string.IsNullOrWhiteSpace(cursor) ? liveEvents.Snapshot(id) : null,
+            recentItemsPage,
+            recentItemsTurnId,
+            recovery,
+            commandOutbox.Snapshot(id, 20)));
     }
-    catch (CodexRpcException ex) when (ApiHelpers.IsUnmaterializedThread(ex))
+    catch (CodexRpcException ex) when (ApiHelpers.IsUnmaterializedThread(ex) ||
+        ex.IsHistoryInitializing && codex.IsThreadStarting(id))
     {
-        return Results.Ok(ApiHelpers.PagedThread(metadata, default, id, runtimeStates.Get(id)));
+        return Results.Ok(ApiHelpers.PagedThread(
+            metadata,
+            default,
+            id,
+            runtimeStates.Get(id),
+            string.IsNullOrWhiteSpace(cursor) ? liveEvents.Snapshot(id) : null,
+            recoveryState: codex.RecoverySnapshotFor(id),
+            commandReceipts: commandOutbox.Snapshot(id, 20)));
     }
     catch (CodexRpcException ex) when (ex.Code == -32601)
     {
@@ -274,6 +489,19 @@ app.MapGet("/api/threads/{id}", async (
             kind = "codexUpgradeRequired"
         }, statusCode: StatusCodes.Status501NotImplemented);
     }
+});
+
+app.MapGet("/api/threads/{id}/live", async (
+    string id,
+    long? after,
+    int? waitMs,
+    ThreadLiveEventStore liveEvents,
+    CancellationToken cancellationToken) =>
+{
+    var revision = Math.Max(0, after ?? 0);
+    var wait = TimeSpan.FromMilliseconds(Math.Clamp(waitMs ?? 25_000, 250, 25_000));
+    var snapshot = await liveEvents.WaitForChangeAsync(id, revision, wait, cancellationToken);
+    return Results.Ok(new { revision = snapshot.Revision, turns = snapshot.Turns });
 });
 
 app.MapGet("/api/permissions", async (
@@ -301,56 +529,136 @@ app.MapGet("/api/permissions", async (
     }
 });
 
+app.MapGet("/api/models", async (
+    bool? forceRefresh,
+    CodexModelCatalog models,
+    CancellationToken cancellationToken) =>
+    Results.Ok(new
+    {
+        data = await models.ListAsync(forceRefresh == true, cancellationToken)
+    }));
+
 app.MapPost("/api/threads", async (
     ThreadCreate request,
     CodexAppServer codex,
-    CancellationToken cancellationToken) =>
+    IHostApplicationLifetime applicationLifetime) =>
 {
-    var workspace = string.IsNullOrWhiteSpace(request.Cwd) ? Environment.CurrentDirectory : request.Cwd;
+    // After ASP.NET has accepted the command, the bridge owns its lifetime.
+    // A phone/WebView disconnect must not cancel an app-server dispatch.
+    var operationToken = applicationLifetime.ApplicationStopping;
+    var workspace = string.IsNullOrWhiteSpace(request.Cwd)
+        ? Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
+        : request.Cwd;
     var permissions = ExecutionPermissions.Parse(request.Permissions, request.ApprovalPolicy, request.ApprovalsReviewer);
-    return Results.Ok(await codex.StartThreadAsync(workspace, permissions, cancellationToken));
+    return Results.Ok(await codex.StartThreadAsync(workspace, permissions, operationToken));
 });
 
 app.MapPost("/api/threads/{id}/messages", async (
     string id,
     MessageRequest request,
     CodexAppServer codex,
-    ThreadRuntimeStateStore runtimeStates,
+    CodexModelCatalog models,
+    ThreadCommandOutboxStore commandOutbox,
+    ThreadCommandOutboxDispatcher commandDispatcher,
     FileTransferService files,
-    CancellationToken cancellationToken) =>
+    ChromeBootstrapService browser,
+    IHostApplicationLifetime applicationLifetime) =>
 {
-    if (ApiHelpers.ExternalActiveConflict(runtimeStates, id) is { } conflict) return conflict;
+    // Persist before dispatch. The mobile HTTP connection is only the producer;
+    // disconnecting it cannot cancel or lose an accepted computer command.
+    var operationToken = applicationLifetime.ApplicationStopping;
+    var browserBootstrap = request.BrowserRequired == true
+        ? await browser.EnsureStartedAsync("浏览器任务开始", operationToken)
+        : null;
     var input = new List<object>();
     if (!string.IsNullOrWhiteSpace(request.Text))
         input.Add(new { type = "text", text = request.Text, text_elements = Array.Empty<object>() });
     input.AddRange(files.BuildCodexInputs(id, request.AttachmentIds));
-    input.AddRange(await ApiHelpers.BuildSkillInputsAsync(codex, id, request.Skills, cancellationToken));
+    input.AddRange(await ApiHelpers.BuildSkillInputsAsync(codex, id, request.Skills, operationToken));
     if (input.Count == 0) return Results.BadRequest(new { error = "Message and attachments are empty." });
     var permissions = ExecutionPermissions.Parse(request.Permissions, request.ApprovalPolicy, request.ApprovalsReviewer);
-    var result = await codex.SendUserInputAsync(
-        id, input, request.ClientUserMessageId, null, permissions, cancellationToken);
-    return Results.Ok(result);
+    var options = await models.NormalizeAsync(request.Model, request.ReasoningEffort, operationToken);
+    var receipt = commandOutbox.Enqueue(
+        id,
+        JsonSerializer.SerializeToElement(input),
+        request.ClientUserMessageId,
+        null,
+        permissions,
+        options);
+    commandDispatcher.Wake();
+    return Results.Accepted($"/api/threads/{Uri.EscapeDataString(id)}/commands/{receipt.Id}", new
+    {
+        queued = receipt.Status == ThreadCommandStatus.Queued,
+        receipt,
+        browser = browserBootstrap
+    });
 });
 
 app.MapPost("/api/threads/{id}/steer", async (
     string id,
     SteerRequest request,
     CodexAppServer codex,
-    ThreadRuntimeStateStore runtimeStates,
+    CodexModelCatalog models,
+    ThreadCommandOutboxStore commandOutbox,
+    ThreadCommandOutboxDispatcher commandDispatcher,
     FileTransferService files,
-    CancellationToken cancellationToken) =>
+    ChromeBootstrapService browser,
+    IHostApplicationLifetime applicationLifetime) =>
 {
-    if (ApiHelpers.ExternalActiveConflict(runtimeStates, id) is { } conflict) return conflict;
+    // A stale or Desktop-owned turn is not an HTTP conflict. The durable outbox
+    // waits until ownership is safe, then reconciles the expected turn id.
+    var operationToken = applicationLifetime.ApplicationStopping;
+    var browserBootstrap = request.BrowserRequired == true
+        ? await browser.EnsureStartedAsync("浏览器任务续跑", operationToken)
+        : null;
     var input = new List<object>();
     if (!string.IsNullOrWhiteSpace(request.Text))
         input.Add(new { type = "text", text = request.Text, text_elements = Array.Empty<object>() });
     input.AddRange(files.BuildCodexInputs(id, request.AttachmentIds));
-    input.AddRange(await ApiHelpers.BuildSkillInputsAsync(codex, id, request.Skills, cancellationToken));
+    input.AddRange(await ApiHelpers.BuildSkillInputsAsync(codex, id, request.Skills, operationToken));
     if (input.Count == 0) return Results.BadRequest(new { error = "Message and attachments are empty." });
     var permissions = ExecutionPermissions.Parse(request.Permissions, request.ApprovalPolicy, request.ApprovalsReviewer);
-    var result = await codex.SendUserInputAsync(
-        id, input, request.ClientUserMessageId, request.TurnId, permissions, cancellationToken);
-    return Results.Ok(result);
+    var options = await models.NormalizeAsync(request.Model, request.ReasoningEffort, operationToken);
+    var receipt = commandOutbox.Enqueue(
+        id,
+        JsonSerializer.SerializeToElement(input),
+        request.ClientUserMessageId,
+        request.TurnId,
+        permissions,
+        options);
+    commandDispatcher.Wake();
+    return Results.Accepted($"/api/threads/{Uri.EscapeDataString(id)}/commands/{receipt.Id}", new
+    {
+        queued = receipt.Status == ThreadCommandStatus.Queued,
+        receipt,
+        browser = browserBootstrap
+    });
+});
+
+app.MapGet("/api/threads/{id}/commands", (
+    string id,
+    int? limit,
+    ThreadCommandOutboxStore commandOutbox) =>
+    Results.Ok(new { commands = commandOutbox.Snapshot(id, Math.Clamp(limit ?? 20, 1, 100)) }));
+
+app.MapGet("/api/threads/{id}/commands/{receiptId}", (
+    string id,
+    string receiptId,
+    ThreadCommandOutboxStore commandOutbox) =>
+    commandOutbox.Find(id, receiptId) is { } receipt
+        ? Results.Ok(new { queued = receipt.Status == ThreadCommandStatus.Queued, receipt })
+        : Results.NotFound(new { error = "The command receipt was not found." }));
+
+app.MapDelete("/api/threads/{id}/commands/{receiptId}", (
+    string id,
+    string receiptId,
+    ThreadCommandOutboxStore commandOutbox,
+    ThreadCommandOutboxDispatcher commandDispatcher) =>
+{
+    if (!commandOutbox.Cancel(id, receiptId))
+        return Results.Conflict(new { error = "This command was not found or can no longer be cancelled." });
+    commandDispatcher.Wake();
+    return Results.Ok(new { receipt = commandOutbox.Find(id, receiptId) });
 });
 
 app.MapPost("/api/threads/{id}/interrupt", async (
@@ -484,7 +792,39 @@ app.MapPost("/api/files/register", async (
 {
     if (string.IsNullOrWhiteSpace(request.ThreadId)) return Results.BadRequest(new { error = "A task id is required." });
     var cwd = await ApiHelpers.GetThreadCwdAsync(codex, request.ThreadId, cancellationToken);
-    return Results.Ok(files.RegisterExisting(request.Path, cwd, request.ThreadId));
+    try
+    {
+        return Results.Ok(files.RegisterExisting(request.Path, cwd, request.ThreadId));
+    }
+    catch (Exception original) when (original is FileNotFoundException or DirectoryNotFoundException or UnauthorizedAccessException)
+    {
+        var referenced = await ThreadArtifactResolver.ResolveAsync(
+            codex,
+            request.ThreadId,
+            request.Path,
+            cancellationToken);
+        if (referenced is not null)
+            return Results.Ok(await files.StoreThreadDeliveryAsync(referenced, request.ThreadId, cancellationToken));
+
+        return original switch
+        {
+            UnauthorizedAccessException => Results.Json(
+                new { error = "The file is outside the task workspace and was not referenced as a task delivery." },
+                statusCode: StatusCodes.Status403Forbidden),
+            DirectoryNotFoundException => Results.NotFound(new
+            {
+                error = "The task workspace no longer exists and this file reference could not be resolved."
+            }),
+            _ => Results.NotFound(new
+            {
+                error = "The file reference could not be resolved from this task. The source file may still exist elsewhere."
+            })
+        };
+    }
+    catch (Exception ex) when (ex is ArgumentException or InvalidDataException or NotSupportedException)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
 });
 
 app.MapGet("/api/files", (string? threadId, FileTransferService files) => Results.Ok(new { files = files.List(threadId) }));
@@ -530,8 +870,10 @@ app.MapGet("/api/threads/{id}/goal", async (
     ThreadRuntimeStateStore runtimeStates,
     CancellationToken cancellationToken) =>
 {
-    if (ApiHelpers.ExternalActiveConflict(runtimeStates, id) is { } conflict) return conflict;
-    await codex.EnsureThreadLoadedAsync(id, cancellationToken);
+    // Goals are live app-server state. Do not resume a released task merely to
+    // render a read-only panel; the next mutating action will acquire access.
+    if (!codex.HasThreadAccess(id))
+        return Results.Ok(new { goal = (object?)null, access = "released" });
     return Results.Ok(await codex.CallAsync("thread/goal/get", new { threadId = id }, cancellationToken));
 });
 
@@ -545,13 +887,17 @@ app.MapPut("/api/threads/{id}/goal", async (
     if (ApiHelpers.ExternalActiveConflict(runtimeStates, id) is { } conflict) return conflict;
     ApiHelpers.ValidateGoal(request);
     await codex.EnsureThreadLoadedAsync(id, cancellationToken);
-    return Results.Ok(await codex.CallAsync("thread/goal/set", new
+    try
     {
-        threadId = id,
-        objective = request.Objective,
-        status = request.Status,
-        tokenBudget = request.TokenBudget
-    }, cancellationToken));
+        return Results.Ok(await codex.CallAsync("thread/goal/set", new
+        {
+            threadId = id,
+            objective = request.Objective,
+            status = request.Status,
+            tokenBudget = request.TokenBudget
+        }, cancellationToken));
+    }
+    finally { codex.ScheduleThreadAccessRelease(id); }
 });
 
 app.MapDelete("/api/threads/{id}/goal", async (
@@ -562,7 +908,11 @@ app.MapDelete("/api/threads/{id}/goal", async (
 {
     if (ApiHelpers.ExternalActiveConflict(runtimeStates, id) is { } conflict) return conflict;
     await codex.EnsureThreadLoadedAsync(id, cancellationToken);
-    return Results.Ok(await codex.CallAsync("thread/goal/clear", new { threadId = id }, cancellationToken));
+    try
+    {
+        return Results.Ok(await codex.CallAsync("thread/goal/clear", new { threadId = id }, cancellationToken));
+    }
+    finally { codex.ScheduleThreadAccessRelease(id); }
 });
 
 app.MapPost("/api/threads/{id}/compact", async (
@@ -573,7 +923,11 @@ app.MapPost("/api/threads/{id}/compact", async (
 {
     if (ApiHelpers.ExternalActiveConflict(runtimeStates, id) is { } conflict) return conflict;
     await codex.EnsureThreadLoadedAsync(id, cancellationToken);
-    return Results.Ok(await codex.CallAsync("thread/compact/start", new { threadId = id }, cancellationToken));
+    try
+    {
+        return Results.Ok(await codex.CallAsync("thread/compact/start", new { threadId = id }, cancellationToken));
+    }
+    finally { codex.ScheduleThreadAccessRelease(id); }
 });
 
 app.MapGet("/api/commands", () => Results.Ok(ApiHelpers.CommandCatalog));
@@ -605,17 +959,31 @@ app.MapPost("/api/threads/{id}/commands", async (
         case "compact":
             if (ApiHelpers.ExternalActiveConflict(runtimeStates, id) is { } compactConflict) return compactConflict;
             await codex.EnsureThreadLoadedAsync(id, cancellationToken);
-            return Results.Ok(await codex.CallAsync("thread/compact/start", new { threadId = id }, cancellationToken));
+            try
+            {
+                return Results.Ok(await codex.CallAsync("thread/compact/start", new { threadId = id }, cancellationToken));
+            }
+            finally { codex.ScheduleThreadAccessRelease(id); }
         case "goal":
         case "go":
         {
-            if (ApiHelpers.ExternalActiveConflict(runtimeStates, id) is { } goalConflict) return goalConflict;
-            await codex.EnsureThreadLoadedAsync(id, cancellationToken);
             var arguments = request.Arguments?.Trim() ?? "";
             if (string.IsNullOrWhiteSpace(request.Objective) && string.IsNullOrWhiteSpace(request.Status) && request.TokenBudget is null && arguments.Length == 0)
+            {
+                if (!codex.HasThreadAccess(id))
+                    return Results.Ok(new { goal = (object?)null, access = "released" });
                 return Results.Ok(await codex.CallAsync("thread/goal/get", new { threadId = id }, cancellationToken));
+            }
+            if (ApiHelpers.ExternalActiveConflict(runtimeStates, id) is { } goalConflict) return goalConflict;
+            await codex.EnsureThreadLoadedAsync(id, cancellationToken);
             if (arguments.Equals("clear", StringComparison.OrdinalIgnoreCase))
-                return Results.Ok(await codex.CallAsync("thread/goal/clear", new { threadId = id }, cancellationToken));
+            {
+                try
+                {
+                    return Results.Ok(await codex.CallAsync("thread/goal/clear", new { threadId = id }, cancellationToken));
+                }
+                finally { codex.ScheduleThreadAccessRelease(id); }
+            }
             var status = request.Status;
             var objective = request.Objective;
             if (string.IsNullOrWhiteSpace(status) && string.IsNullOrWhiteSpace(objective))
@@ -631,13 +999,17 @@ app.MapPost("/api/threads/{id}/commands", async (
             }
             var update = new GoalUpdate(objective, status, request.TokenBudget);
             ApiHelpers.ValidateGoal(update);
-            return Results.Ok(await codex.CallAsync("thread/goal/set", new
+            try
             {
-                threadId = id,
-                objective = update.Objective,
-                status = update.Status,
-                tokenBudget = update.TokenBudget
-            }, cancellationToken));
+                return Results.Ok(await codex.CallAsync("thread/goal/set", new
+                {
+                    threadId = id,
+                    objective = update.Objective,
+                    status = update.Status,
+                    tokenBudget = update.TokenBudget
+                }, cancellationToken));
+            }
+            finally { codex.ScheduleThreadAccessRelease(id); }
         }
         default:
             return Results.BadRequest(new { error = $"Unknown command: /{command}" });
@@ -671,14 +1043,83 @@ app.MapPost("/api/local-links/resolve", async (HttpContext context, LocalLinkReq
 
 app.MapGet("/api/projects", (ProjectScanner projects) => projects.Scan());
 app.MapGet("/api/processes", () => ProcessApi.List());
-app.MapPost("/api/processes/{pid:int}/stop", (int pid, StopProcessRequest request) =>
+app.MapGet("/api/diagnostics/console-launches", (int? limit, ConsoleLaunchAuditService audit) =>
+{
+    var snapshot = audit.Snapshot(Math.Clamp(limit ?? 100, 1, 256));
+    return Results.Ok(new
+    {
+        supported = snapshot.IsSupported,
+        capturing = snapshot.IsRunning,
+        status = snapshot.Status,
+        generatedAt = snapshot.GeneratedAt,
+        events = snapshot.Events.Select(item =>
+        {
+            var chain = new List<ConsoleLaunchAuditProcess>();
+            foreach (var process in item.ParentChain.Reverse().Append(item.CommandProcess))
+            {
+                if (chain.All(existing => existing.ProcessId != process.ProcessId)) chain.Add(process);
+            }
+            if (chain.Count == 0 || chain[^1].ProcessId != item.WindowProcess.ProcessId)
+                chain.Add(item.WindowProcess);
+            return new
+            {
+                id = item.Id.ToString(),
+                firstSeenAt = item.FirstObservedAt,
+                lastSeenAt = item.ObservedAt,
+                count = item.RepeatCount,
+                intervalSeconds = item.IntervalMilliseconds is null ? (double?)null : Math.Round(item.IntervalMilliseconds.Value / 1000, 2),
+                averageIntervalSeconds = item.AverageIntervalMilliseconds is null ? (double?)null : Math.Round(item.AverageIntervalMilliseconds.Value / 1000, 2),
+                item.Classification,
+                item.Explanation,
+                item.WindowTitle,
+                item.WindowClass,
+                windowProcess = ApiHelpers.ConsoleAuditProcess(item.WindowProcess),
+                commandProcess = ApiHelpers.ConsoleAuditProcess(item.CommandProcess),
+                sourceProcess = item.CandidateLaunchingProcess is null ? null : ApiHelpers.ConsoleAuditProcess(item.CandidateLaunchingProcess),
+                chain = chain.Select(ApiHelpers.ConsoleAuditProcess).ToArray(),
+                item.ParentChainComplete,
+                commandLine = ApiHelpers.RedactCommandLine(item.CommandLine),
+                executablePath = item.ExecutablePath
+            };
+        }).ToArray()
+    });
+});
+app.MapPost("/api/diagnostics/console-audit/capture", async (
+    ConsoleAuditCaptureRequest request,
+    ConsoleLaunchAuditService audit,
+    CancellationToken cancellationToken) =>
+{
+    if (!audit.IsSupported) return Results.BadRequest(new { error = "Console launch auditing is supported on Windows only." });
+    if (request.Enabled) await audit.StartAsync(cancellationToken);
+    else await audit.StopAsync(cancellationToken);
+    return Results.Ok(new { supported = audit.IsSupported, capturing = audit.IsRunning });
+});
+app.MapPost("/api/diagnostics/console-audit/clear", (
+    ConsoleAuditClearRequest request,
+    ConsoleLaunchAuditService audit) =>
+{
+    if (!string.Equals(request.Confirmation, "CLEAR AUDIT", StringComparison.Ordinal))
+        return Results.BadRequest(new { error = "Type CLEAR AUDIT to confirm." });
+    audit.Clear();
+    return Results.Ok(new { cleared = true });
+});
+app.MapPost("/api/processes/{pid:int}/stop", (
+    int pid,
+    StopProcessRequest request,
+    ConsoleLaunchAuditService audit) =>
 {
     if (request.Confirmation != $"STOP {pid}") return Results.BadRequest(new { error = $"Type STOP {pid} to confirm." });
     if (pid == Environment.ProcessId) return Results.BadRequest(new { error = "The bridge cannot stop itself." });
     try
     {
         using var process = Process.GetProcessById(pid);
-        if (!ProcessApi.IsAllowed(process.ProcessName)) return Results.BadRequest(new { error = "This process is not managed by Codex LAN Console." });
+        string? path = null;
+        DateTimeOffset? startedAt = null;
+        try { path = process.MainModule?.FileName; } catch { }
+        try { startedAt = process.StartTime; } catch { }
+        if (!ProcessApi.IsAllowed(process.ProcessName) &&
+            !audit.MatchesObservedSource(pid, process.ProcessName, path, startedAt))
+            return Results.BadRequest(new { error = "This process is neither managed nor a currently observed popup source." });
         process.Kill(entireProcessTree: true);
         return Results.Ok();
     }
@@ -688,12 +1129,26 @@ app.MapPost("/api/processes/{pid:int}/stop", (int pid, StopProcessRequest reques
 app.MapFallbackToFile("index.html");
 
 var pairing = app.Services.GetRequiredService<PairingService>();
-Console.WriteLine($"Codex LAN Console: {LocalAddress.GetConsoleUrl(Environment.GetEnvironmentVariable("CODEX_LAN_URLS"))}");
-Console.WriteLine($"Pairing code: {pairing.Code} (valid until restart or successful pairing)");
+if (bridgeBinding.AdministratorMode)
+{
+    foreach (var url in bridgeBinding.Urls) Console.WriteLine($"Codex LAN Console: {url}");
+}
+else
+{
+    Console.WriteLine($"Codex LAN Console: {LocalAddress.GetConsoleUrl(configuredBridgeUrls)}");
+}
+if (pairing.IsTemporaryPairingOpen)
+    Console.WriteLine($"Pairing code: {pairing.Code} (expires {pairing.CodeExpiresAt:O}, or immediately after successful pairing)");
+else if (pairing.HasPersistentAdministratorCode)
+    Console.WriteLine("Persistent administrator sign-in: enabled (the code is never printed or stored in plaintext)");
+else
+    Console.WriteLine("Pairing: closed (use the local Windows manager to add another Administrator device)");
 Console.WriteLine($"Pairing details: {pairing.PairingFile}");
 app.Run();
+GC.KeepAlive(singleInstanceMutex);
 
 record PairRequest(string? Code, string? DeviceName);
+record BrowserSettingsRequest(bool AutoStartWithBridge);
 record ThreadCreate(
     string? Cwd,
     string? Permissions,
@@ -706,7 +1161,10 @@ record MessageRequest(
     SkillReference[]? Skills,
     string? Permissions,
     string? ApprovalPolicy,
-    string? ApprovalsReviewer);
+    string? ApprovalsReviewer,
+    string? Model,
+    string? ReasoningEffort,
+    bool? BrowserRequired);
 record SteerRequest(
     string? TurnId,
     string? Text,
@@ -715,7 +1173,10 @@ record SteerRequest(
     SkillReference[]? Skills,
     string? Permissions,
     string? ApprovalPolicy,
-    string? ApprovalsReviewer);
+    string? ApprovalsReviewer,
+    string? Model,
+    string? ReasoningEffort,
+    bool? BrowserRequired);
 record SkillReference(string Name, string? Path);
 record ExistingFileRequest(string ThreadId, string Path);
 record GoalUpdate(string? Objective, string? Status, long? TokenBudget);
@@ -727,9 +1188,37 @@ record UserInputResponse(Dictionary<string, UserInputAnswer> Answers);
 record ElicitationResponse(string Action, JsonElement? Content, string? Persistence);
 record LocalLinkRequest(string Url);
 record StopProcessRequest(string Confirmation);
+record ConsoleAuditCaptureRequest(bool Enabled);
+record ConsoleAuditClearRequest(string Confirmation);
+static class CpuGuardApi
+{
+    public static bool IsLoopbackRequest(HttpContext context) =>
+        context.Connection.RemoteIpAddress is { } address && IPAddress.IsLoopback(address);
+
+    public static bool IsAuthorizedLocalControl(HttpContext context, LocalControlTokenStore tokens) =>
+        IsLoopbackRequest(context) && tokens.Validate(context.Request.Headers[LocalControlTokenStore.HeaderName].ToString());
+
+    public static string FormatStatus(CpuHealthSnapshot snapshot)
+    {
+        static string Number(double? value, string suffix) => value.HasValue ? $"{value.Value:F0}{suffix}" : "n/a";
+        var telemetry = snapshot.Telemetry;
+        return string.Join(Environment.NewLine,
+            $"CPU guard: {snapshot.Mode} / {snapshot.State}",
+            $"P-core: load {Number(telemetry?.PerformanceCoreLoadPercent, "%")}, " +
+            $"actual {Number(telemetry?.PerformanceCoreFrequencyMhz, " MHz")}, " +
+            $"performance {Number(telemetry?.PerformanceCorePerformancePercent, "%")}",
+            $"Power: {(telemetry is null ? "n/a" : telemetry.OnAcPower ? "AC" : "battery")}",
+            $"Summary: {snapshot.Summary}");
+    }
+}
 
 static class ApiHelpers
 {
+    private static readonly Regex ConsoleAuditSecret = new(
+        "(?ix)(authorization\\s*[:=]\\s*(?:bearer\\s+)?|(?:token|api[-_]?key|password|passwd|secret)\\s*[:=]\\s*)[^\\s\\\"']+|\\b(?:ghp_|github_pat_|sk-)[A-Za-z0-9_-]+",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant,
+        TimeSpan.FromMilliseconds(100));
+
     private static readonly HashSet<string> GoalStatuses = new(StringComparer.Ordinal)
     {
         "active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"
@@ -744,13 +1233,42 @@ static class ApiHelpers
         new { command = "/compact", description = "Compact older context for this task." }
     };
 
+    public static object ConsoleAuditProcess(ConsoleLaunchAuditProcess process) => new
+    {
+        processId = process.ProcessId,
+        parentProcessId = process.ParentProcessId,
+        process.Name,
+        process.ExecutablePath,
+        commandLine = RedactCommandLine(process.CommandLine),
+        process.StartedAt
+    };
+
+    public static string? RedactCommandLine(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return value;
+        try
+        {
+            return ConsoleAuditSecret.Replace(value, match =>
+            {
+                var text = match.Value;
+                var separator = Math.Max(text.LastIndexOf('='), text.LastIndexOf(':'));
+                return separator >= 0 ? text[..(separator + 1)] + "[REDACTED]" : "[REDACTED]";
+            });
+        }
+        catch (RegexMatchTimeoutException)
+        {
+            return "[REDACTED: command was too complex to scan safely]";
+        }
+    }
+
     private const int MaximumMobileStringCharacters = 64 * 1024;
-    private const int MaximumMobileVerboseStringCharacters = 32 * 1024;
     private const int MaximumMobileCollectionItems = 256;
     private const int MaximumMobileJsonDepth = 24;
-    private static readonly HashSet<string> VerboseFields = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly HashSet<string> SuppressedMobileFields = new(StringComparer.OrdinalIgnoreCase)
     {
-        "aggregatedOutput", "diff", "output", "result", "toolResult"
+        "aggregatedOutput", "arguments", "command", "commandLine", "diff",
+        "encrypted_content", "encryptedContent", "input", "output", "raw",
+        "rawOutput", "result", "stderr", "stdout", "toolResult"
     };
 
     public static IResult? ExternalActiveConflict(ThreadRuntimeStateStore runtimeStates, string threadId)
@@ -764,11 +1282,25 @@ static class ApiHelpers
         });
     }
 
+    public static string? LatestTurnId(JsonElement newestFirstTurnPage)
+    {
+        if (newestFirstTurnPage.ValueKind != JsonValueKind.Object ||
+            !newestFirstTurnPage.TryGetProperty("data", out var turns) ||
+            turns.ValueKind != JsonValueKind.Array ||
+            turns.GetArrayLength() == 0) return null;
+        return Text(turns[0], "id");
+    }
+
     public static object PagedThread(
         JsonElement metadataResult,
         JsonElement turnPage,
         string fallbackId,
-        ThreadRuntimeSnapshot? runtimeState)
+        ThreadRuntimeSnapshot? runtimeState,
+        LiveThreadSnapshot? liveSnapshot = null,
+        JsonElement recentItemsPage = default,
+        string? recentItemsTurnId = null,
+        BridgeTurnRecoverySnapshot? recoveryState = null,
+        IReadOnlyList<ThreadCommandReceipt>? commandReceipts = null)
     {
         var thread = metadataResult.TryGetProperty("thread", out var nested) ? nested : metadataResult;
         var turns = turnPage.ValueKind == JsonValueKind.Object &&
@@ -778,6 +1310,8 @@ static class ApiHelpers
             : Array.Empty<JsonElement>();
         // The app-server page is newest-first; the conversation view renders oldest-first.
         Array.Reverse(turns);
+        var mergedTurns = MergeRecentItems(turns, recentItemsPage, recentItemsTurnId);
+        mergedTurns = MergeLiveTurns(mergedTurns, liveSnapshot?.Turns ?? Array.Empty<JsonElement>());
         var nextCursor = Text(turnPage, "nextCursor");
         var hasEarlier = !string.IsNullOrEmpty(nextCursor);
         return new
@@ -789,18 +1323,355 @@ static class ApiHelpers
                 preview = Text(thread, "preview"),
                 cwd = Text(thread, "cwd"),
                 status = Element(thread, "status"),
-                turns
+                turns = mergedTurns
             },
             // Keep the legacy fields in the response. Cursor-aware clients use nextCursor;
             // totalTurnsExact explains why the page-local count is not a history-wide count.
             start = 0,
-            totalTurns = turns.Length,
+            totalTurns = mergedTurns.Length,
             totalTurnsExact = !hasEarlier,
             hasEarlier,
             nextCursor,
             backwardsCursor = Text(turnPage, "backwardsCursor"),
-            runtimeState
+            runtimeState,
+            turnRecovery = recoveryState,
+            commandOutbox = commandReceipts ?? Array.Empty<ThreadCommandReceipt>(),
+            recentItemsTruncated = !string.IsNullOrWhiteSpace(Text(recentItemsPage, "nextCursor")),
+            liveRevision = liveSnapshot?.Revision ?? 0
         };
+    }
+
+    private static JsonElement[] MergeRecentItems(
+        IReadOnlyList<JsonElement> persistedTurns,
+        JsonElement recentItemsPage,
+        string? expectedTurnId)
+    {
+        var result = persistedTurns.Select(turn => turn.Clone()).ToArray();
+        if (string.IsNullOrWhiteSpace(expectedTurnId) ||
+            recentItemsPage.ValueKind != JsonValueKind.Object ||
+            !recentItemsPage.TryGetProperty("data", out var entries) ||
+            entries.ValueKind != JsonValueKind.Array) return result;
+
+        var recent = entries.EnumerateArray()
+            .Take(64)
+            .Reverse()
+            .Where(entry => string.IsNullOrWhiteSpace(Text(entry, "turnId")) ||
+                            Text(entry, "turnId")!.Equals(expectedTurnId, StringComparison.Ordinal))
+            .Select(entry => entry.ValueKind == JsonValueKind.Object && entry.TryGetProperty("item", out var item)
+                ? ProjectRecentItem(item)
+                : ProjectRecentItem(entry))
+            .ToArray();
+        if (recent.Length == 0) return result;
+
+        for (var index = 0; index < result.Length; index++)
+        {
+            if (!string.Equals(Text(result[index], "id"), expectedTurnId, StringComparison.Ordinal)) continue;
+            result[index] = ReplaceTurnItemsWithRecentTail(result[index], recent);
+            break;
+        }
+        return result;
+    }
+
+    private static JsonElement ReplaceTurnItemsWithRecentTail(
+        JsonElement turn,
+        IReadOnlyList<JsonElement> recentItems)
+    {
+        var items = new List<JsonElement>();
+        var positions = new Dictionary<string, int>(StringComparer.Ordinal);
+        var recentTurn = JsonSerializer.SerializeToElement(new { items = recentItems });
+        var recentKeys = ItemKeys(recentTurn);
+        var recentMessages = MessageKeys(recentTurn);
+        AddSummaryItems(
+            turn, items, positions, recentKeys, recentMessages,
+            item => !string.Equals(Text(item, "type"), "agentMessage", StringComparison.Ordinal));
+        AddItems(recentTurn, items, positions, replace: true);
+        AddSummaryItems(
+            turn, items, positions, recentKeys, recentMessages,
+            item => string.Equals(Text(item, "type"), "agentMessage", StringComparison.Ordinal));
+        return JsonSerializer.SerializeToElement(new
+        {
+            id = Text(turn, "id"),
+            items = items.ToArray(),
+            itemsView = "recentFull",
+            status = Element(turn, "status"),
+            error = Element(turn, "error"),
+            startedAt = Element(turn, "startedAt"),
+            completedAt = Element(turn, "completedAt"),
+            durationMs = Element(turn, "durationMs")
+        });
+    }
+
+    private static JsonElement ProjectRecentItem(JsonElement item)
+    {
+        var type = Text(item, "type") ?? "tool";
+        if (type is "userMessage" or "agentMessage") return BoundForMobile(item);
+
+        object projected;
+        if (type.Equals("reasoning", StringComparison.Ordinal))
+        {
+            projected = new
+            {
+                id = Text(item, "id"),
+                type,
+                status = Element(item, "status"),
+                summary = Element(item, "summary") ?? Element(item, "content"),
+                createdAt = Element(item, "createdAt"),
+                updatedAt = Element(item, "updatedAt")
+            };
+        }
+        else if (type.Equals("plan", StringComparison.Ordinal))
+        {
+            projected = new
+            {
+                id = Text(item, "id"),
+                type,
+                status = Element(item, "status"),
+                text = Text(item, "text") ?? Text(item, "message"),
+                content = Element(item, "content"),
+                createdAt = Element(item, "createdAt"),
+                updatedAt = Element(item, "updatedAt")
+            };
+        }
+        else if (type.Contains("fileChange", StringComparison.OrdinalIgnoreCase))
+        {
+            var changes = item.TryGetProperty("changes", out var source) && source.ValueKind == JsonValueKind.Array
+                ? source.EnumerateArray().Take(12).Select(change => new
+                {
+                    path = Text(change, "path") ?? Text(change, "filePath"),
+                    kind = Text(change, "kind") ?? Text(change, "type")
+                }).Where(change => !string.IsNullOrWhiteSpace(change.path)).ToArray()
+                : Array.Empty<object>();
+            projected = new
+            {
+                id = Text(item, "id"),
+                callId = Text(item, "callId") ?? Text(item, "call_id"),
+                type,
+                status = Element(item, "status"),
+                changes,
+                createdAt = Element(item, "createdAt"),
+                updatedAt = Element(item, "updatedAt")
+            };
+        }
+        else
+        {
+            projected = new
+            {
+                id = Text(item, "id"),
+                callId = Text(item, "callId") ?? Text(item, "call_id"),
+                type,
+                status = Element(item, "status"),
+                name = Text(item, "name"),
+                tool = Text(item, "tool"),
+                server = Text(item, "server"),
+                method = Text(item, "method"),
+                createdAt = Element(item, "createdAt"),
+                updatedAt = Element(item, "updatedAt")
+            };
+        }
+        return BoundForMobile(JsonSerializer.SerializeToElement(projected));
+    }
+
+    private static JsonElement[] MergeLiveTurns(
+        IReadOnlyList<JsonElement> persistedTurns,
+        IReadOnlyList<JsonElement> liveTurns)
+    {
+        var result = persistedTurns.Select(turn => turn.Clone()).ToList();
+        var positions = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (var index = 0; index < result.Count; index++)
+        {
+            var id = Text(result[index], "id");
+            if (!string.IsNullOrWhiteSpace(id)) positions[id] = index;
+        }
+
+        var newestLiveId = liveTurns.Count == 0 ? null : Text(liveTurns[^1], "id");
+        var newestLiveAlreadyPersisted = !string.IsNullOrWhiteSpace(newestLiveId) &&
+                                         positions.ContainsKey(newestLiveId);
+        foreach (var live in liveTurns)
+        {
+            var id = Text(live, "id");
+            if (string.IsNullOrWhiteSpace(id)) continue;
+            if (positions.TryGetValue(id, out var position)) result[position] = MergeTurn(result[position], live);
+            else if (!newestLiveAlreadyPersisted && string.Equals(id, newestLiveId, StringComparison.Ordinal))
+            {
+                positions[id] = result.Count;
+                result.Add(live.Clone());
+            }
+        }
+        return result.TakeLast(20).ToArray();
+    }
+
+    private static JsonElement MergeTurn(JsonElement persisted, JsonElement live)
+    {
+        var items = new List<JsonElement>();
+        var positions = new Dictionary<string, int>(StringComparer.Ordinal);
+        var persistedView = Text(persisted, "itemsView") ?? "summary";
+        if (persistedView is "recentFull" or "full")
+        {
+            // thread/items/list is the canonical timeline. Live events may update an
+            // item or extend the tail, but must never move an existing reply.
+            AddItems(persisted, items, positions, replace: false);
+            AddItems(live, items, positions, replace: true);
+        }
+        else
+        {
+            // A summary normally contains only the first user message and latest
+            // assistant reply. Keep summary-only leading items, use the live tail for
+            // process order, then append a summary-only final reply.
+            var liveKeys = ItemKeys(live);
+            var liveMessages = MessageKeys(live);
+            AddSummaryItems(
+                persisted, items, positions, liveKeys, liveMessages,
+                item => !string.Equals(Text(item, "type"), "agentMessage", StringComparison.Ordinal));
+            AddItems(live, items, positions, replace: true);
+            AddSummaryItems(
+                persisted, items, positions, liveKeys, liveMessages,
+                item => string.Equals(Text(item, "type"), "agentMessage", StringComparison.Ordinal));
+        }
+        return JsonSerializer.SerializeToElement(new
+        {
+            id = Text(live, "id") ?? Text(persisted, "id"),
+            items = items.ToArray(),
+            itemsView = "full",
+            status = Element(live, "status") ?? Element(persisted, "status"),
+            error = Element(live, "error") ?? Element(persisted, "error"),
+            startedAt = Element(live, "startedAt") ?? Element(persisted, "startedAt"),
+            completedAt = Element(live, "completedAt") ?? Element(persisted, "completedAt"),
+            durationMs = Element(live, "durationMs") ?? Element(persisted, "durationMs")
+        });
+    }
+
+    private static void AddItems(
+        JsonElement turn,
+        List<JsonElement> items,
+        Dictionary<string, int> positions,
+        bool replace)
+    {
+        if (!turn.TryGetProperty("items", out var source) || source.ValueKind != JsonValueKind.Array) return;
+        foreach (var item in source.EnumerateArray())
+        {
+            var key = ItemKey(item);
+            if (string.IsNullOrWhiteSpace(key) || !positions.TryGetValue(key, out var position))
+            {
+                if (!string.IsNullOrWhiteSpace(key)) positions[key] = items.Count;
+                items.Add(BoundForMobile(item));
+            }
+            else if (replace)
+            {
+                items[position] = MergeItem(items[position], item);
+            }
+        }
+    }
+
+    private static void AddSummaryItems(
+        JsonElement turn,
+        List<JsonElement> items,
+        Dictionary<string, int> positions,
+        IReadOnlySet<string> liveKeys,
+        IReadOnlySet<string> liveMessages,
+        Func<JsonElement, bool> predicate)
+    {
+        if (!turn.TryGetProperty("items", out var source) || source.ValueKind != JsonValueKind.Array) return;
+        foreach (var item in source.EnumerateArray())
+        {
+            if (!predicate(item)) continue;
+            var key = ItemKey(item);
+            var message = MessageKey(item);
+            if (!string.IsNullOrWhiteSpace(key) && liveKeys.Contains(key)) continue;
+            if (IsWeakSummaryItem(item) &&
+                !string.IsNullOrWhiteSpace(message) &&
+                liveMessages.Contains(message)) continue;
+            if (!string.IsNullOrWhiteSpace(key) && positions.ContainsKey(key)) continue;
+            if (!string.IsNullOrWhiteSpace(key)) positions[key] = items.Count;
+            items.Add(BoundForMobile(item));
+        }
+    }
+
+    private static HashSet<string> ItemKeys(JsonElement turn)
+    {
+        if (!turn.TryGetProperty("items", out var source) || source.ValueKind != JsonValueKind.Array)
+            return new HashSet<string>(StringComparer.Ordinal);
+        return source.EnumerateArray()
+            .Select(ItemKey)
+            .Where(key => !string.IsNullOrWhiteSpace(key))
+            .Cast<string>()
+            .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private static HashSet<string> MessageKeys(JsonElement turn)
+    {
+        if (!turn.TryGetProperty("items", out var source) || source.ValueKind != JsonValueKind.Array)
+            return new HashSet<string>(StringComparer.Ordinal);
+        return source.EnumerateArray()
+            .Select(MessageKey)
+            .Where(key => !string.IsNullOrWhiteSpace(key))
+            .Cast<string>()
+            .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private static string? ItemKey(JsonElement item)
+    {
+        var callId = Text(item, "callId") ?? Text(item, "call_id");
+        if (!string.IsNullOrWhiteSpace(callId)) return $"call:{callId}";
+        var id = Text(item, "id");
+        if (string.IsNullOrWhiteSpace(id)) return MessageKey(item);
+        const string externalPrefix = "external-call-";
+        if (id.StartsWith(externalPrefix, StringComparison.Ordinal))
+            return $"call:{id[externalPrefix.Length..]}";
+        if (id.StartsWith("call_", StringComparison.Ordinal) ||
+            id.StartsWith("call-", StringComparison.Ordinal) ||
+            id.StartsWith("exec-", StringComparison.Ordinal))
+            return $"call:{id}";
+        return $"id:{id}";
+    }
+
+    private static bool IsWeakSummaryItem(JsonElement item)
+    {
+        var id = Text(item, "id");
+        return string.IsNullOrWhiteSpace(id) ||
+               id.StartsWith("item-", StringComparison.Ordinal) &&
+               int.TryParse(id.AsSpan("item-".Length), out _);
+    }
+
+    private static string? MessageKey(JsonElement item)
+    {
+        var type = Text(item, "type");
+        if (type is not ("userMessage" or "agentMessage")) return null;
+        var text = Text(item, "text") ?? Text(item, "message");
+        if (string.IsNullOrWhiteSpace(text) &&
+            item.TryGetProperty("content", out var content) &&
+            content.ValueKind == JsonValueKind.Array)
+        {
+            text = string.Join('\n', content.EnumerateArray()
+                .Select(part => part.ValueKind == JsonValueKind.String ? part.GetString() : Text(part, "text"))
+                .Where(part => !string.IsNullOrWhiteSpace(part)));
+        }
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        var normalized = string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        var phase = type == "agentMessage" ? Text(item, "phase") ?? "" : "";
+        return $"{type}:{phase}:{normalized}";
+    }
+
+    private static JsonElement MergeItem(JsonElement persisted, JsonElement live)
+    {
+        var properties = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+        foreach (var property in persisted.EnumerateObject()) properties[property.Name] = property.Value.Clone();
+        foreach (var property in live.EnumerateObject()) properties[property.Name] = property.Value.Clone();
+        if (Text(persisted, "id") is { } stableId)
+            properties["id"] = JsonSerializer.SerializeToElement(stableId);
+        if (string.Equals(Text(live, "type") ?? Text(persisted, "type"), "agentMessage", StringComparison.Ordinal))
+        {
+            var before = Text(persisted, "text") ?? "";
+            var after = Text(live, "text") ?? "";
+            properties["text"] = JsonSerializer.SerializeToElement(after.Length >= before.Length ? after : before);
+        }
+        foreach (var name in new[] { "summary", "content" })
+        {
+            var before = Element(persisted, name);
+            var after = Element(live, name);
+            if (before is { } left && (after is null || left.GetRawText().Length > after.Value.GetRawText().Length))
+                properties[name] = left;
+        }
+        return BoundForMobile(JsonSerializer.SerializeToElement(properties));
     }
 
     public static object LegacyThreadPage(
@@ -842,10 +1713,7 @@ static class ApiHelpers
     }
 
     public static bool IsUnmaterializedThread(CodexRpcException exception) =>
-        exception.Message.Contains("not materialized", StringComparison.OrdinalIgnoreCase) ||
-        exception.Message.Contains("before first user message", StringComparison.OrdinalIgnoreCase) ||
-        (exception.Message.Contains("rollout", StringComparison.OrdinalIgnoreCase) &&
-         exception.Message.Contains("empty", StringComparison.OrdinalIgnoreCase));
+        exception.IsUnmaterializedThread;
 
     private static JsonElement BoundForMobile(JsonElement element)
     {
@@ -883,6 +1751,7 @@ static class ApiHelpers
                 var propertyCount = 0;
                 foreach (var property in element.EnumerateObject())
                 {
+                    if (SuppressedMobileFields.Contains(property.Name)) continue;
                     if (propertyCount++ >= MaximumMobileCollectionItems) break;
                     writer.WritePropertyName(property.Name);
                     WriteBounded(writer, property.Value, depth + 1, property.Name);
@@ -906,11 +1775,8 @@ static class ApiHelpers
                     writer.WriteStringValue("[大体积二进制内容已省略]");
                     break;
                 }
-                var maximum = propertyName is not null && VerboseFields.Contains(propertyName)
-                    ? MaximumMobileVerboseStringCharacters
-                    : MaximumMobileStringCharacters;
-                writer.WriteStringValue(value.Length > maximum
-                    ? value[..maximum] + "\n[内容过长，手机端仅显示前段]"
+                writer.WriteStringValue(value.Length > MaximumMobileStringCharacters
+                    ? value[..MaximumMobileStringCharacters] + "\n[内容过长，手机端仅显示前段]"
                     : value);
                 break;
             case JsonValueKind.Number:
@@ -937,10 +1803,24 @@ static class ApiHelpers
                LooksLikeLargeInlineBinary(url.GetString() ?? "");
     }
 
-    private static bool LooksLikeLargeInlineBinary(string value) =>
-        value.Length > 4096 &&
-        value.StartsWith("data:", StringComparison.OrdinalIgnoreCase) &&
-        value.IndexOf(";base64,", StringComparison.OrdinalIgnoreCase) >= 0;
+    private static bool LooksLikeLargeInlineBinary(string value)
+    {
+        if (value.Length <= 4096) return false;
+        if (value.StartsWith("data:", StringComparison.OrdinalIgnoreCase) &&
+            value.IndexOf(";base64,", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+
+        // Rollout payloads sometimes contain bare Base64 without a data: prefix.
+        // Sample a bounded prefix so detection itself remains cheap.
+        var sampleLength = Math.Min(value.Length, 8192);
+        var allowed = 0;
+        for (var index = 0; index < sampleLength; index++)
+        {
+            var character = value[index];
+            if (character is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or >= '0' and <= '9' or '+' or '/' or '=')
+                allowed++;
+        }
+        return allowed >= sampleLength * 0.995;
+    }
 
     private static JsonElement? Element(JsonElement element, string name) =>
         element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out var value)
@@ -1024,7 +1904,7 @@ static class ApiHelpers
         if (!string.IsNullOrWhiteSpace(threadId))
         {
             if (runtimeStates.IsExternallyOwnedActive(threadId)) effectiveThreadId = null;
-            else await codex.EnsureThreadLoadedAsync(threadId, cancellationToken);
+            else if (!codex.HasThreadAccess(threadId)) effectiveThreadId = null;
         }
         var response = await codex.CallAsync("mcpServerStatus/list", new
         {

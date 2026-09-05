@@ -1,0 +1,5 @@
+<resources>
+    <string name="quota_widget_name">Codex 额度</string>
+    <string name="quota_widget_description">显示当前 Codex 额度、消耗速度与预计可用时间</string>
+    <string name="quota_widget_refresh">刷新 Codex 额度</string>
+</resources>

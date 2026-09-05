@@ -18,5 +18,7 @@ public final class NotificationBootReceiver extends BroadcastReceiver {
                 && CodexNotificationService.hasNotificationPermission(context)) {
             CodexNotificationService.start(context);
         }
+        CodexQuotaWidgetUpdater.renderCached(context);
+        CodexQuotaWidgetUpdater.requestRefresh(context, false, null);
     }
 }

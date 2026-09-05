@@ -88,8 +88,41 @@
     justify-content: flex-start;
   }
 
+  .remote-work-card {
+    padding: 14px;
+  }
+
+  .remote-work-sheet:not(.remote-work-inline) {
+    max-height: 92dvh;
+  }
+
   .risk-sheet {
     padding: 17px;
+  }
+
+  .console-audit {
+    padding: 13px;
+  }
+
+  .console-audit-actions {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .console-audit-actions button {
+    width: 100%;
+    padding-right: 5px;
+    padding-left: 5px;
+    white-space: normal;
+  }
+
+  .console-launch-card,
+  .console-launch-details,
+  .console-launch-details dd,
+  .audit-code {
+    max-width: 100%;
+    overflow-x: hidden;
   }
 }
 
@@ -152,9 +185,36 @@
     width: calc(100% - 16px);
   }
 
+  .thread-load-state {
+    align-items: flex-start;
+  }
+
+  .thread-load-actions {
+    flex-direction: column;
+  }
+
+  .thread-load-actions button {
+    min-width: 64px;
+  }
+
   .notification-actions {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .remote-work-heading {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .remote-work-heading .browser-badge {
+    grid-column: 1 / -1;
+    width: max-content;
+    max-width: 100%;
+  }
+
+  .remote-work-actions,
+  .remote-work-submit {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .notification-actions button {
@@ -189,6 +249,23 @@
 
   .artifact-actions {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .artifact-unavailable {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .artifact-retry {
+    width: 100%;
+  }
+
+  .console-audit-actions,
+  .console-launch-details dl > div {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .console-launch-heading {
+    gap: 7px;
   }
 }
 

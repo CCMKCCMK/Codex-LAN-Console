@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#0c0f0e"><title>Codex LAN Console</title>
-  <link rel="manifest" href="/manifest.webmanifest"><link rel="stylesheet" href="/styles.css?v=29"><link rel="stylesheet" href="/mobile.css?v=29">
+  <link rel="manifest" href="/manifest.webmanifest"><link rel="stylesheet" href="/console-theme.css?v=2"><link rel="stylesheet" href="/styles.css?v=53"><link rel="stylesheet" href="/mobile.css?v=53">
 </head>
 <body>
   <div id="pair" class="overlay hidden">
@@ -15,11 +15,7 @@
     </form>
   </div>
 
-  <header><div><span class="eyebrow">LOCAL ONLY · 1.6.0</span><h1>Codex Console</h1></div><button id="refresh" class="icon">↻</button></header>
-  <aside id="autoApproveBanner" class="auto-approve-banner hidden" role="status" aria-live="polite">
-    <div><b>自动允许后续审批已开启</b><small>Console 管理的新审批会直接选择 Yes；需要回答的问题不会自动处理。</small></div>
-    <button type="button" id="manageAutoApprove" class="secondary">管理</button>
-  </aside>
+  <header class="console-header"><div><span class="eyebrow">LOCAL ONLY · 1.9.0</span><h1>Codex Console</h1></div><button id="refresh" class="icon" aria-label="刷新当前页面">↻</button></header>
   <aside id="diagnostic" class="diagnostic hidden" role="alert" aria-live="assertive">
     <div class="diagnostic-heading"><div><small>电脑端返回错误</small><h2 id="diagnosticTitle">操作没有完成</h2></div><button type="button" id="diagnosticClose" class="icon" aria-label="关闭错误详情">×</button></div>
     <p id="diagnosticMessage"></p>
@@ -27,8 +23,19 @@
     <div class="diagnostic-actions"><button type="button" id="diagnosticCopy">复制诊断信息</button><button type="button" id="diagnosticRefresh">重新加载</button></div>
   </aside>
   <main>
-    <section id="overview" class="page active">
+    <section id="settings" class="page">
+      <div class="sectionTitle"><h2>设置</h2></div>
+      <div class="settings-links">
+        <a href="/commute/?panel=settings" class="settings-link"><span>↗</span><div><b>通勤时间与偏好</b><small>到达时间、出行工具、每日提醒</small></div><span>›</span></a>
+        <button type="button" class="settings-link" data-settings-page="approvals"><span>✓</span><div><b>权限与审批</b><small id="settingsApprovalStatus">自动批准与待处理请求</small></div><span>›</span></button>
+        <button type="button" class="settings-link" data-settings-page="processes"><span>▥</span><div><b>电脑进程与诊断</b><small>运行程序、资源占用、弹窗来源</small></div><span>›</span></button>
+      </div>
       <div class="status"><i id="dot"></i><div><b id="machine">正在连接</b><small id="state">检查本地桥接服务</small></div></div>
+      <section id="administratorModeCard" class="administrator-mode-card unknown" aria-live="polite">
+        <span class="administrator-mode-icon" aria-hidden="true">A</span>
+        <div><h2>管理员模式</h2><p id="administratorModeDescription">正在读取电脑端进程权限。</p></div>
+        <span id="administratorModeBadge" class="administrator-mode-badge">检查中</span>
+      </section>
       <section id="notificationCard" class="notification-card hidden" aria-live="polite">
         <div class="notification-copy">
           <div class="notification-heading"><h2>后台通知</h2><span id="notificationBadge" class="notification-badge">未开启</span></div>
@@ -40,15 +47,42 @@
           <button type="button" id="notificationSettings" class="secondary hidden">系统设置</button>
         </div>
       </section>
-      <div class="metrics"><article><b id="threadCount">-</b><small>最近任务</small></article><article><b id="projectCount">-</b><small>项目</small></article><article><b id="processCount">-</b><small>相关进程</small></article></div>
-      <div class="sectionTitle"><h2>最近任务</h2><button onclick="showPage('threads')">查看全部</button></div><div id="recentThreads" class="list"></div>
-      <div class="sectionTitle"><h2>待处理审批</h2><button id="approveRecent" class="hidden">一键允许全部待审批</button></div><div id="recentApprovals" class="list"></div>
     </section>
-    <section id="threads" class="page"><div class="sectionTitle"><h2>任务</h2><button id="newThread">新建</button></div><div id="threadList" class="list"></div></section>
-    <section id="projects" class="page"><div class="sectionTitle"><h2>项目</h2></div><div id="projectList" class="list"></div></section>
-    <section id="processes" class="page"><div class="sectionTitle"><h2>相关进程</h2><button id="reloadProcesses">刷新</button></div><p class="hint">只展示开发相关进程。停止进程前必须输入确认文本。</p><div id="processList" class="list"></div></section>
+    <section id="threads" class="page active"><div class="sectionTitle"><div><h2>任务</h2><p class="hint">电脑上的工作，随时接着做。</p></div><button id="newThread">＋ 新建任务</button></div><button id="taskAttention" class="task-attention hidden" data-settings-page="approvals"></button><div id="threadList" class="list"></div></section>
+    <section id="remote" class="page">
+      <div class="sectionTitle"><div><h2>远程控制</h2><p class="hint">让 AI 操作电脑上的 Chrome。</p></div></div>
+      <form id="remoteWorkForm" class="remote-work-sheet remote-work-inline">
+        <label>要完成什么<textarea id="remoteWorkGoal" rows="4" placeholder="例如：比较这两件商品，把合适的加入购物车；不要付款。" required></textarea></label>
+        <div class="remote-examples" aria-label="常用事务"><button type="button" data-remote-example="帮我比较以下商品的价格和规格，列出建议，先不要下单：">购物比较</button><button type="button" data-remote-example="帮我填写下面的表格，缺失的信息请问我，先不要最终提交：">填表申请</button><button type="button" data-remote-example="帮我在以下网站查找并整理资料，给出来源：">查找资料</button></div>
+        <label>从哪个网页开始（可选）<input id="remoteWorkUrl" type="url" inputmode="url" autocomplete="url" placeholder="https://..."></label>
+        <div class="remote-work-boundary"><b>关键操作由你确认</b><p>付款、最终提交、验证码等步骤会停下来问你。任务进展与结果都在“任务”里。</p></div>
+        <button type="submit" id="remoteWorkSubmit">启动 Chrome 并开始</button>
+      </form>
+      <section id="remoteWorkCard" class="remote-work-card card" aria-live="polite">
+        <div class="remote-work-heading"><div><h3>电脑浏览器</h3></div><span id="browserBadge" class="browser-badge checking">检查中</span></div>
+        <p id="browserDescription">正在检查电脑上的 Chrome。</p><button type="button" id="startBrowser" class="secondary">启动 Chrome</button>
+        <label class="browser-autostart" for="browserAutoStart"><span><b>随 Bridge 启动 Chrome</b><small>电脑重启后也能准备就绪。</small></span><input id="browserAutoStart" type="checkbox" role="switch" checked></label>
+      </section>
+    </section>
+    <section id="processes" class="page">
+      <button type="button" class="back" onclick="showPage('settings', { historyMode: 'replace' })">← 设置</button>
+      <div class="sectionTitle"><h2>进程与弹窗诊断</h2><button id="reloadProcesses">刷新</button></div>
+      <section id="consoleAudit" class="console-audit card" aria-live="polite">
+        <div class="console-audit-heading"><div><small>来源追踪</small><h3>终端弹窗来源</h3></div><span id="consoleAuditBadge" class="badge">等待加载</span></div>
+        <p id="consoleAuditDescription">记录短暂出现的 CMD、PowerShell 和终端窗口，并说明它是由哪个程序启动的。</p>
+        <div class="console-audit-actions">
+          <button type="button" id="reloadConsoleAudit" class="secondary">刷新记录</button>
+          <button type="button" id="toggleConsoleAudit" class="secondary" disabled>暂停记录</button>
+          <button type="button" id="clearConsoleAudit" class="danger" disabled>清空记录</button>
+        </div>
+        <div id="consoleLaunchList" class="console-launch-list"></div>
+      </section>
+      <div class="sectionTitle process-list-heading"><h2>相关进程</h2></div>
+      <p class="hint">只展示开发相关进程。停止进程前必须输入确认文本。</p><div id="processList" class="list"></div>
+    </section>
     <section id="approvals" class="page">
-      <div class="sectionTitle"><h2>审批</h2><button id="approveAllPending" class="hidden">一键允许全部待审批</button></div>
+      <button type="button" class="back" onclick="showPage('settings', { historyMode: 'replace' })">← 设置</button>
+      <div class="sectionTitle"><h2>权限与审批</h2><button id="approveAllPending" class="hidden">一键允许全部待审批</button></div>
       <section id="approvalAutomation" class="approval-automation card" aria-live="polite">
         <div class="approval-automation-heading"><div><small>后续请求</small><h3>自动批准</h3></div><span id="autoApproveBadge" class="notification-badge">已关闭</span></div>
         <p id="autoApproveDescription">开启后，电脑端桥接服务会对 Console 管理的新审批自动选择允许。需要你回答的问题仍会停下来。</p>
@@ -61,7 +95,11 @@
     </section>
     <section id="threadDetail" class="page">
       <button class="back" onclick="CodexConsoleHandleBack()">← 返回</button><h2 id="detailTitle">任务</h2>
-      <div id="turns" class="turns"></div><div id="detailPending" class="pending-stack"></div>
+      <div id="threadLoadState" class="thread-load-state hidden" role="status" aria-live="polite">
+        <div><b id="threadLoadTitle">正在检查最新内容</b><small id="threadLoadMeta"></small></div>
+        <div class="thread-load-actions"><button type="button" id="threadLoadDetails" class="secondary">详情</button><button type="button" id="threadLoadRetry">重试</button></div>
+      </div>
+      <div id="turns" class="turns"></div><button id="newMessages" class="new-messages hidden" type="button">↓ 有新消息</button><div id="detailPending" class="pending-stack"></div>
       <form id="composer">
         <div class="intent-row" role="group" aria-label="指令类型">
           <button type="button" class="intent active" data-intent="plain">直接</button>
@@ -77,6 +115,10 @@
         </div>
         <div id="selectedCommands" class="selected-commands hidden" aria-label="已选择的能力"></div>
         <div id="attachmentPreview" class="attachment-preview hidden" aria-live="polite"></div>
+        <div class="model-settings" aria-label="本次运行方式">
+          <label><span>模型</span><select id="modelChoice"><option value="">沿用任务设置</option><option value="gpt-5.6-sol">5.6 Sol</option><option value="gpt-5.6-terra">5.6 Terra</option></select></label>
+          <label><span>思考深度</span><select id="reasoningEffort"><option value="">自动选择</option><option value="low">轻量</option><option value="medium">标准</option><option value="high">深入</option><option value="xhigh">更深入</option><option value="max">最高</option><option value="ultra">极限</option></select></label>
+        </div>
         <textarea id="message" rows="2" enterkeyhint="send" placeholder="你希望 Codex 做什么？也可以只添加附件。"></textarea>
         <details id="composerDetails">
           <summary>添加细节</summary>
@@ -94,11 +136,19 @@
           </div>
           <p id="permissionHint" class="permission-hint">完全自主：整台电脑无沙箱运行，不发起逐项审批。</p>
         </details>
+        <details id="commandFailure" class="hidden"><summary>查看发送失败原因</summary><pre id="commandFailureText" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre></details>
         <div class="composer-footer"><button type="button" id="interruptTurn" class="danger hidden">停止</button><small id="sendMode">发送新的指令</small><button id="sendMessage" type="submit">发送</button></div>
       </form>
     </section>
   </main>
-  <nav><button data-page="overview" class="active">⌂<span>概览</span></button><button data-page="threads">◎<span>任务</span></button><button data-page="projects">◇<span>项目</span></button><button data-page="processes">▥<span>进程</span></button><button data-page="approvals">✓<span>审批</span></button></nav>
+  <nav class="app-nav console-nav" aria-label="主要功能"><button data-page="threads" class="active" aria-current="page">◎<span>任务</span></button><a href="/commute/" data-page="commute">↗<span>通勤</span></a><button data-page="remote">▣<span>远程控制</span></button><button data-page="settings">⚙<span>设置</span></button></nav>
+  <dialog id="newTaskDialog" class="new-task-dialog" aria-labelledby="newTaskTitle"><form id="newTaskForm">
+    <div class="sectionTitle"><h2 id="newTaskTitle">新建任务</h2><button type="button" id="closeNewTask" class="icon" aria-label="关闭">×</button></div>
+    <p class="hint">普通事务无需选择项目；修改代码时再选择工作文件夹。</p>
+    <label for="newTaskPath">项目路径（可选）</label><input id="newTaskPath" autocomplete="off" placeholder="留空创建普通任务，或输入电脑上的文件夹路径">
+    <details id="projectPicker"><summary>选择已有项目</summary><div id="projectList" class="list"></div></details>
+    <p id="newTaskError" class="form-error" role="alert"></p><button id="createNewTask" type="submit">创建任务</button>
+  </form></dialog>
   <div id="commandPanel" class="command-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="commandTitle">
     <button type="button" class="command-backdrop" aria-label="关闭快捷操作"></button>
     <section class="command-sheet">
@@ -118,5 +168,5 @@
       <div class="risk-actions"><button type="button" id="riskCancel" class="secondary">取消</button><button type="button" id="riskConfirm" class="danger" disabled>确认启用</button></div>
     </section>
   </div>
-  <div id="toast"></div><script src="/marked.umd.js?v=29"></script><script src="/thread-status.js?v=29"></script><script src="/app.js?v=29"></script>
+  <div id="toast"></div><script src="/notification-navigation.js?v=1"></script><script src="/marked.umd.js?v=52"></script><script src="/thread-status.js?v=52"></script><script src="/thread-resilience.js?v=52"></script><script src="/thread-stream.js?v=52"></script><script src="/model-settings.js?v=52"></script><script src="/remote-artifacts.js?v=52"></script><script src="/administrator-mode.js?v=52"></script><script src="/app.js?v=54"></script>
 </body></html>

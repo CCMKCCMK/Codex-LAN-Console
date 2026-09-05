@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/quota_widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/transparent"
+    android:padding="3dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:gravity="center_horizontal"
+        android:orientation="vertical">
+
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="18dp">
+
+            <TextView
+                android:id="@+id/quota_title"
+                android:layout_width="wrap_content"
+                android:layout_height="match_parent"
+                android:gravity="center_vertical"
+                android:shadowColor="#CC000000"
+                android:shadowDx="0"
+                android:shadowDy="1"
+                android:shadowRadius="2"
+                android:text="CODEX"
+                android:textColor="#FF7BF1BD"
+                android:textSize="10sp"
+                android:textStyle="bold" />
+
+            <ImageView
+                android:id="@+id/quota_refresh"
+                android:layout_width="18dp"
+                android:layout_height="18dp"
+                android:layout_gravity="end"
+                android:contentDescription="@string/quota_widget_refresh"
+                android:padding="2dp"
+                android:src="@drawable/ic_widget_refresh" />
+        </FrameLayout>
+
+        <TextView
+            android:id="@+id/quota_remaining"
+            android:layout_width="match_parent"
+            android:layout_height="30dp"
+            android:gravity="center"
+            android:includeFontPadding="false"
+            android:shadowColor="#E6000000"
+            android:shadowDx="0"
+            android:shadowDy="1"
+            android:shadowRadius="3"
+            android:text="--%"
+            android:textColor="#FFFFFFFF"
+            android:textSize="25sp"
+            android:textStyle="bold" />
+
+        <ProgressBar
+            android:id="@+id/quota_progress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="4dp"
+            android:layout_marginStart="2dp"
+            android:layout_marginEnd="2dp"
+            android:max="100"
+            android:progress="0"
+            android:progressBackgroundTint="#4DFFFFFF"
+            android:progressTint="#FF7BF1BD" />
+
+        <TextView
+            android:id="@+id/quota_primary_estimate"
+            android:layout_width="match_parent"
+            android:layout_height="18dp"
+            android:gravity="center"
+            android:includeFontPadding="false"
+            android:maxLines="1"
+            android:shadowColor="#E6000000"
+            android:shadowDx="0"
+            android:shadowDy="1"
+            android:shadowRadius="2"
+            android:text="预计 --"
+            android:textColor="#FFFFFFFF"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/quota_estimators"
+            android:layout_width="match_parent"
+            android:layout_height="14dp"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:includeFontPadding="false"
+            android:maxLines="1"
+            android:shadowColor="#E6000000"
+            android:shadowDx="0"
+            android:shadowDy="1"
+            android:shadowRadius="2"
+            android:text="近 -- · 稳 -- · 窗 --"
+            android:textColor="#E6FFFFFF"
+            android:textSize="8sp" />
+
+        <TextView
+            android:id="@+id/quota_meta"
+            android:layout_width="match_parent"
+            android:layout_height="14dp"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:includeFontPadding="false"
+            android:maxLines="1"
+            android:shadowColor="#E6000000"
+            android:shadowDx="0"
+            android:shadowDy="1"
+            android:shadowRadius="2"
+            android:text="点按刷新"
+            android:textColor="#BFFFFFFF"
+            android:textSize="8sp" />
+    </LinearLayout>
+</FrameLayout>

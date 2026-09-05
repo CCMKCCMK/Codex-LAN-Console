@@ -270,6 +270,10 @@ public final class CodexNotificationService extends Service {
                 if (!isCurrent(session)) {
                     break;
                 }
+                // The widget updater is internally throttled and returns immediately. Calling
+                // it after each successful long poll keeps visible widgets close to live data
+                // without adding a second permanent background service.
+                CodexQuotaWidgetUpdater.requestRefresh(this, false, null);
                 updateMonitorNotification("已连接，正在等待 Codex 任务状态");
                 broadcastStatus(this);
 

@@ -78,9 +78,11 @@ overlay network such as Tailscale or Headscale.
 
 The unauthenticated health and pairing endpoints are reachable by devices that
 can reach the bridge. Pairing is rate-limited, but the six-digit code remains a
-sensitive rotating secret. It stays valid until the bridge restarts or a
-pairing succeeds; it does not currently expire on a timer. The health response
-may reveal the Windows machine name and service state to that trusted network.
+sensitive rotating secret. Each code expires after ten minutes and is replaced
+or closed immediately after a successful pairing. Administrator Mode opens a
+new code only on first setup or after an explicit local Windows action. The
+health response may reveal the Windows machine name and service state to that
+trusted network.
 
 ## Full autonomous and auto-approval modes
 
@@ -101,6 +103,32 @@ understands the consequences. They must not bypass an administrator or
 enterprise policy. Security reports about an unexpected privilege escalation
 or a misleading permission state are in scope; the documented consequences of
 an explicitly selected high-privilege mode are not by themselves a defect.
+
+## Windows Administrator Mode
+
+Administrator Mode is a separate, explicit trust boundary. It requires local
+Windows UAC consent to install or change the Highest scheduled task. The task
+may execute only a hash-checked release copied beneath Program Files with protected
+ACLs; it must never point at a user-writable repository or download directory.
+
+Standard device registrations do not authorize Administrator Mode. The elevated
+Bridge uses a separate per-SID protected credential store and binds only
+loopback plus an active Tailscale IPv4 address. Additional Administrator devices
+can be enrolled only through a ten-minute window opened locally with UAC; the
+window closes after one successful enrollment and existing device hashes remain
+valid. Every paired phone must be protected as an administrator credential.
+
+The mode does not disable UAC or automate the Windows secure desktop. It affects
+only child work created by that elevated Bridge process; existing desktop Codex
+rounds and unrelated applications are outside its scope. See
+`docs/ADMINISTRATOR_MODE_SECURITY.md` for the enforced and residual boundaries.
+
+The private bootstrap is not Authenticode-signed. Its copy-time hashes detect
+transfer changes but are not a publisher-authenticity check, so initial consent
+trusts the local user-writable installation. The elevated Bridge also gives its
+token to Codex and invoked project tools; running user-writable scripts in this
+mode intentionally runs them as administrator. Public distribution is blocked
+until the bootstrap is anchored in a publisher signature.
 
 ## Coordinated disclosure
 

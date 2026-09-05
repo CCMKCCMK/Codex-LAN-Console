@@ -50,6 +50,9 @@ The ASP.NET Core bridge:
 - exposes the internal mobile HTTP API;
 - starts and communicates with `codex app-server` through local standard input
   and output;
+- reads persisted task history without subscribing to the task, acquires an
+  app-server subscription only for interaction, and calls `thread/unsubscribe`
+  after a completed turn or bounded idle period;
 - paginates and bounds task data for mobile display;
 - tracks approval, question, task, and notification state;
 - dispatches every app-server host request to a protocol-specific handler,
@@ -87,11 +90,14 @@ would require a separately designed APNs service.
 
 ## Authentication and session flow
 
-1. The bridge creates a six-digit code on startup and writes it to the local
-   pairing file.
+1. The bridge creates a ten-minute six-digit code on startup and writes it to
+   the local pairing file. Administrator Mode does this only for initial setup
+   or after the local manager writes a protected one-shot enrollment request.
 2. A client submits the code to the pairing endpoint.
 3. The bridge rate-limits failures, issues a random 256-bit bearer token, stores
-   only its SHA-256 hash, rotates the code, and sets an HttpOnly session cookie.
+   only its SHA-256 hash, invalidates the used code, and sets an HttpOnly session
+   cookie. Standard Mode rotates to another time-limited code; Administrator
+   Mode closes the window after one enrollment.
 4. Native clients keep the raw token in platform-protected storage and can use
    it to restore the web session.
 5. All API routes except health and pairing require a valid bearer token or

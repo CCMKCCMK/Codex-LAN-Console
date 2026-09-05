@@ -70,6 +70,8 @@ public class MainActivity extends Activity {
     private static final int STORAGE_PERMISSION_REQUEST = 7001;
     private static final int FILE_CHOOSER_REQUEST = 7002;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 7003;
+    private static final int SCOOTER_PERMISSION_REQUEST = 7004;
+    private String pendingScooterRideId;
     private static final long MAX_BLOB_BYTES = 512L * 1024L * 1024L;
     private static final long CAPTURE_DELETE_DELAY_MS = 60L * 60L * 1000L;
     private static final long CAPTURE_STALE_AFTER_MS = 24L * 60L * 60L * 1000L;
@@ -79,6 +81,8 @@ public class MainActivity extends Activity {
     private static final String STATE_WEB_VIEW = "web_view";
     private static final String STATE_PENDING_NOTIFICATION_THREAD =
             "pending_notification_thread";
+    private static final String STATE_PENDING_NOTIFICATION_AT = "pending_notification_at";
+    private static final long NOTIFICATION_ROUTE_TTL_MS = 60000L;
     private static final Handler DELAYED_FILE_CLEANUP = new Handler(Looper.getMainLooper());
 
     private final Map<Long, DownloadRecord> downloads = new ConcurrentHashMap<>();
@@ -95,6 +99,8 @@ public class MainActivity extends Activity {
     private String pendingNotificationThreadId;
     private String pendingNotificationRouteAttempt;
     private boolean notificationRouteInFlight;
+    private long pendingNotificationReceivedAt;
+    private int notificationRouteAttempts;
     private PendingDownload pendingDownload;
     private PendingBlobRequest pendingBlobRequest;
     private ValueCallback<Uri[]> fileChooserCallback;
@@ -155,11 +161,14 @@ public class MainActivity extends Activity {
         boolean openedFromNotification = captureNotificationIntent(getIntent());
         if (!openedFromNotification && state != null) {
             String restoredThreadId = state.getString(STATE_PENDING_NOTIFICATION_THREAD);
+            long restoredAt = state.getLong(STATE_PENDING_NOTIFICATION_AT, 0L);
             if (restoredThreadId != null
+                    && restoredAt > 0 && System.currentTimeMillis() - restoredAt < NOTIFICATION_ROUTE_TTL_MS
                     && restoredThreadId.length() <= 200
                     && restoredThreadId.matches("[A-Za-z0-9._:/\\-]+")) {
                 synchronized (notificationRouteLock) {
                     pendingNotificationThreadId = restoredThreadId;
+                    pendingNotificationReceivedAt = restoredAt;
                     pendingNotificationRouteAttempt = null;
                     notificationRouteInFlight = false;
                 }
@@ -282,7 +291,7 @@ public class MainActivity extends Activity {
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         settings.setSupportMultipleWindows(false);
         settings.setUserAgentString(
-                settings.getUserAgentString() + " CodexLanConsole/1.6.0");
+                settings.getUserAgentString() + " CodexLanConsole/1.7.7");
 
         CookieManager cookies = CookieManager.getInstance();
         cookies.setAcceptCookie(true);
@@ -290,6 +299,7 @@ public class MainActivity extends Activity {
 
         web.addJavascriptInterface(blobBridge, "CodexAndroidDownloads");
         web.addJavascriptInterface(notificationBridge, "CodexAndroidNotifications");
+        web.addJavascriptInterface(new ScooterBridge(), "CodexAndroidScooter");
         web.setWebViewClient(new ConsoleWebViewClient());
         web.setWebChromeClient(new ConsoleWebChromeClient());
         web.setDownloadListener(this::requestDownload);
@@ -313,6 +323,7 @@ public class MainActivity extends Activity {
                 outState.putString(
                         STATE_PENDING_NOTIFICATION_THREAD,
                         pendingNotificationThreadId);
+                outState.putLong(STATE_PENDING_NOTIFICATION_AT, pendingNotificationReceivedAt);
             }
         }
         super.onSaveInstanceState(outState);
@@ -343,6 +354,7 @@ public class MainActivity extends Activity {
 
         @Override
         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+            if (request.isForMainFrame() && request.hasGesture()) clearPendingNotificationRoute();
             return handleNavigation(view, request.getUrl());
         }
 
@@ -459,6 +471,8 @@ public class MainActivity extends Activity {
             pendingNotificationThreadId = threadId;
             pendingNotificationRouteAttempt = null;
             notificationRouteInFlight = false;
+            pendingNotificationReceivedAt = System.currentTimeMillis();
+            notificationRouteAttempts = 0;
         }
         return true;
     }
@@ -470,7 +484,13 @@ public class MainActivity extends Activity {
         }
         String threadId;
         String attempt;
+        long receivedAt;
         synchronized (notificationRouteLock) {
+            if (pendingNotificationThreadId != null
+                    && (notificationRouteAttempts >= 6
+                    || System.currentTimeMillis() - pendingNotificationReceivedAt > NOTIFICATION_ROUTE_TTL_MS)) {
+                clearPendingNotificationRoute();
+            }
             if (pendingNotificationThreadId == null || notificationRouteInFlight) {
                 return;
             }
@@ -478,6 +498,8 @@ public class MainActivity extends Activity {
             attempt = UUID.randomUUID().toString();
             pendingNotificationRouteAttempt = attempt;
             notificationRouteInFlight = true;
+            receivedAt = pendingNotificationReceivedAt;
+            notificationRouteAttempts++;
         }
         String encoded = JSONObject.quote(threadId);
         String encodedAttempt = JSONObject.quote(attempt);
@@ -485,14 +507,11 @@ public class MainActivity extends Activity {
                 "(() => { const id=" + encoded + ",attempt=" + encodedAttempt + ";"
                         + "const ack=ok=>{try{window.CodexAndroidNotifications"
                         + ".acknowledgeThreadOpen(id,attempt,Boolean(ok));}catch(_){}};"
-                        + "if(typeof openThread!=='function'){ack(false);return false;}"
-                        + "Promise.resolve().then(()=>openThread(id))"
-                        + ".then(()=>typeof refreshCurrentThread==='function'"
-                        + "?refreshCurrentThread(true):Promise.reject(new Error('not ready')))"
-                        + ".then(()=>{const s=typeof normalizedNavigationState==='function'"
-                        + "?normalizedNavigationState():null;"
-                        + "ack(Boolean(s&&s.page==='threadDetail'&&s.threadId===id));},"
-                        + "()=>ack(false));return true;})()",
+                        + "try{if(typeof window.CodexConsoleReceiveNotification==='function')"
+                        + "{ack(window.CodexConsoleReceiveNotification(id,attempt," + receivedAt + "));}"
+                        + "else if(typeof window.CodexConsoleOpenThread==='function')"
+                        + "{ack(window.CodexConsoleOpenThread(id)!==false);}"
+                        + "else{ack(false);}}catch(_){ack(false);}return true;})()",
                 value -> {
                     if (!"true".equalsIgnoreCase(value)) {
                         acknowledgeNotificationRoute(threadId, attempt, false);
@@ -512,8 +531,22 @@ public class MainActivity extends Activity {
             notificationRouteInFlight = false;
             pendingNotificationRouteAttempt = null;
             if (succeeded) {
-                pendingNotificationThreadId = null;
+                clearPendingNotificationRoute();
+            } else if (notificationRouteAttempts < 6) {
+                // Only retry frontend readiness briefly, not task-data loading.
+                runOnUiThread(() -> captureMaintenanceHandler.postDelayed(
+                        MainActivity.this::openPendingNotificationThread, 500L));
             }
+        }
+    }
+
+    private void clearPendingNotificationRoute() {
+        synchronized (notificationRouteLock) {
+            pendingNotificationThreadId = null;
+            pendingNotificationRouteAttempt = null;
+            notificationRouteInFlight = false;
+            pendingNotificationReceivedAt = 0L;
+            notificationRouteAttempts = 0;
         }
     }
 
@@ -1177,6 +1210,13 @@ public class MainActivity extends Activity {
             String[] permissions,
             int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == SCOOTER_PERMISSION_REQUEST) {
+            String id = pendingScooterRideId; pendingScooterRideId = null;
+            if (id != null && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                try { ScooterTrackingService.start(this, id); } catch (RuntimeException ex) { ScooterTrackingService.problem("请回到 App 后重试启动定位。"); }
+            } else ScooterTrackingService.problem("未获得精确定位权限；只记录时长，停止时请补记里程。");
+            return;
+        }
         if (requestCode == NOTIFICATION_PERMISSION_REQUEST) {
             notificationPermissionRequestPending = false;
             boolean granted = grantResults.length > 0
@@ -1236,6 +1276,7 @@ public class MainActivity extends Activity {
         web.stopLoading();
         web.removeJavascriptInterface("CodexAndroidDownloads");
         web.removeJavascriptInterface("CodexAndroidNotifications");
+        web.removeJavascriptInterface("CodexAndroidScooter");
         web.setDownloadListener(null);
         web.setWebChromeClient(null);
         web.setWebViewClient(null);
@@ -1284,6 +1325,7 @@ public class MainActivity extends Activity {
     }
 
     private void handleBackNavigation() {
+        clearPendingNotificationRoute();
         WebView currentWeb = web;
         if (currentWeb == null) {
             finish();
@@ -1400,7 +1442,33 @@ public class MainActivity extends Activity {
         });
     }
 
+    private final class ScooterBridge {
+        @JavascriptInterface public String status() { return ScooterTrackingService.status(); }
+        @JavascriptInterface public String start(String rideId) {
+            if (!trustedConsoleOrigin || rideId == null || !rideId.matches("[0-9a-f]{32}")) return "无效的骑行请求";
+            if (NotificationConfigStore.credentials(MainActivity.this) == null) return "请先完成手机 App 配对";
+            boolean permission = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+            runOnUiThread(() -> {
+                if (!permission) {
+                    pendingScooterRideId = rideId;
+                    requestPermissions(Build.VERSION.SDK_INT >= 33 ? new String[]{Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.POST_NOTIFICATIONS}
+                            : new String[]{Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION}, SCOOTER_PERMISSION_REQUEST);
+                } else try { ScooterTrackingService.start(MainActivity.this, rideId); }
+                catch (RuntimeException ex) { ScooterTrackingService.problem("系统暂未允许后台记录，请返回 App 后重试。"); }
+            });
+            return permission ? "started" : "permission_requested";
+        }
+        @JavascriptInterface public void stop() {
+            if (trustedConsoleOrigin) runOnUiThread(() -> ScooterTrackingService.stop(MainActivity.this));
+        }
+    }
+
     private final class NotificationBridge {
+        @JavascriptInterface
+        public void cancelPendingThreadOpen() {
+            if (trustedConsoleOrigin) clearPendingNotificationRoute();
+        }
+
         @JavascriptInterface
         public void acknowledgeThreadOpen(
                 String threadId,
@@ -1430,6 +1498,8 @@ public class MainActivity extends Activity {
                 return "invalid_token";
             }
             NotificationConfigStore.setLastError(MainActivity.this, "");
+            CodexQuotaWidgetUpdater.renderCached(MainActivity.this);
+            CodexQuotaWidgetUpdater.requestRefresh(MainActivity.this, true, null);
             if (changed && CodexNotificationService.isRunning()) {
                 CodexNotificationService.reload(MainActivity.this);
             }

@@ -6,6 +6,9 @@
 **/DerivedData/
 release/
 tmp/
+artifacts/
+**/Scooter/state.json*
+**/Scooter/*.jsonl
 
 # Local SDK and IDE state
 frontend/android/local.properties

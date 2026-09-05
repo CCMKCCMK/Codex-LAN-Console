@@ -1,0 +1,95 @@
+<Window x:Class="CodexLanBridge.QuotaWidgetWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Codex Quota"
+        Width="176"
+        Height="176"
+        MinWidth="176"
+        MinHeight="176"
+        MaxWidth="176"
+        MaxHeight="176"
+        WindowStyle="None"
+        ResizeMode="NoResize"
+        AllowsTransparency="False"
+        Background="#FF010203"
+        ShowInTaskbar="False"
+        ShowActivated="False"
+        Topmost="False"
+        WindowStartupLocation="Manual"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True"
+        MouseLeftButtonDown="WindowMouseLeftButtonDown">
+    <Window.ContextMenu>
+        <ContextMenu FontFamily="Microsoft YaHei UI">
+            <MenuItem Header="重置位置" Click="ResetPositionClick" />
+        </ContextMenu>
+    </Window.ContextMenu>
+
+    <Grid ToolTip="{Binding ToolTipText}">
+        <Ellipse Width="132"
+                 Height="132"
+                 Margin="0,8,0,0"
+                 VerticalAlignment="Top"
+                 Stroke="#45DCE8E4"
+                 StrokeThickness="7" />
+        <Ellipse x:Name="CompleteRing"
+                 Width="132"
+                 Height="132"
+                 Margin="0,8,0,0"
+                 VerticalAlignment="Top"
+                 Stroke="{Binding AccentBrush}"
+                 StrokeThickness="7"
+                 Visibility="Collapsed" />
+        <Path x:Name="ProgressPath"
+              Stroke="{Binding AccentBrush}"
+              StrokeThickness="7"
+              StrokeStartLineCap="Round"
+              StrokeEndLineCap="Round" />
+
+        <StackPanel Width="118"
+                    Margin="0,28,0,0"
+                    HorizontalAlignment="Center"
+                    VerticalAlignment="Top"
+                    TextBlock.FontFamily="Microsoft YaHei UI"
+                    TextBlock.Foreground="#FFF7FAF9"
+                    TextBlock.TextAlignment="Center">
+            <StackPanel.Effect>
+                <DropShadowEffect Color="#F0000000" BlurRadius="4" ShadowDepth="1" Opacity="0.9" />
+            </StackPanel.Effect>
+            <TextBlock Text="{Binding WindowText}"
+                       FontSize="10"
+                       FontWeight="SemiBold"
+                       Foreground="#DDF7FAF9"
+                       TextTrimming="CharacterEllipsis" />
+            <TextBlock Text="{Binding RemainingText}"
+                       Margin="0,-2,0,-3"
+                       FontFamily="Segoe UI Variable Display, Segoe UI"
+                       FontSize="37"
+                       FontWeight="SemiBold" />
+            <TextBlock Text="{Binding RateText}"
+                       FontFamily="Segoe UI Variable Text, Segoe UI"
+                       FontSize="11"
+                       Foreground="#DDF7FAF9" />
+            <TextBlock Text="{Binding EtaText}"
+                       Margin="0,2,0,0"
+                       FontSize="12"
+                       FontWeight="SemiBold"
+                       Foreground="{Binding AccentBrush}"
+                       TextTrimming="CharacterEllipsis" />
+        </StackPanel>
+
+        <TextBlock Margin="5,0,5,7"
+                   HorizontalAlignment="Center"
+                   VerticalAlignment="Bottom"
+                   FontFamily="Microsoft YaHei UI"
+                   FontSize="8.5"
+                   Foreground="#E8F7FAF9"
+                   Text="{Binding EstimatorsText}"
+                   TextAlignment="Center"
+                   TextTrimming="CharacterEllipsis">
+            <TextBlock.Effect>
+                <DropShadowEffect Color="#F0000000" BlurRadius="3" ShadowDepth="1" Opacity="0.95" />
+            </TextBlock.Effect>
+        </TextBlock>
+    </Grid>
+</Window>

@@ -32,9 +32,14 @@ Successful pairing returns the bearer token and machine name and also sets a
 issuance; the bridge persists only its hash. `POST /api/session` exchanges an
 already valid bearer token for the same session cookie.
 
-Pairing failures are limited per client and globally. The six-digit code and
-bearer token are secrets and must not appear in logs, URLs, issues, or
-screenshots.
+Administrator Mode uses a separate protected device store. A successful pairing
+closes its current enrollment window and later attempts return HTTP 403 with
+`pairingClosed`. The local Windows manager can open a ten-minute, one-enrollment
+window without revoking existing devices. Ordinary-mode tokens are not accepted.
+
+Pairing failures are limited per client and globally. A six-digit code expires
+after ten minutes and is invalidated immediately after successful use. Codes and
+bearer tokens are secrets and must not appear in logs, URLs, issues, or screenshots.
 
 ## Common response behavior
 
@@ -63,11 +68,12 @@ to display without redaction.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/api/health` | Service, pairing, Codex readiness, machine, and time summary. No authentication. |
+| GET | `/api/health` | Service, pairing-open state, Codex readiness, machine, and time summary. No authentication; it does not reveal administrator state. |
 | POST | `/api/pair` | Exchange the current six-digit code for a device token and cookie. No prior authentication. |
 | POST | `/api/session` | Restore the browser cookie from an existing bearer token. |
-| GET | `/api/summary` | Counts and latest bounded state for the overview screen. |
+| GET | `/api/summary` | Counts, latest bounded state, and authenticated Windows Bridge administrator-mode state for the overview screen. |
 | GET | `/api/notifications/events` | Cursor-based notification feed with optional long polling up to 30 seconds. |
+| GET | `/api/quota` | Cached Codex rate-limit window, remaining percentage, reset time, and three local burn-rate estimates for first-party widgets. |
 
 ### Tasks and permissions
 
@@ -76,9 +82,13 @@ to display without redaction.
 | GET | `/api/threads?limit=` | List recent tasks from the Codex state database. |
 | GET | `/api/threads/{id}?paged=true&cursor=&limit=` | Read metadata and a cursor-paginated page of recent turns. Full-history loading is rejected. |
 | POST | `/api/threads` | Create a task with working directory and execution permissions. |
-| POST | `/api/threads/{id}/messages` | Send text, attachments, and skill references. |
-| POST | `/api/threads/{id}/steer` | Add input to an active turn when supported. |
+| POST | `/api/threads/{id}/messages` | Durably queue text, attachments, and skill references; returns a command receipt. |
+| POST | `/api/threads/{id}/steer` | Durably queue input intended for an active turn; stale turn IDs are reconciled before dispatch. |
+| GET | `/api/threads/{id}/commands?limit=` | Read recent durable command receipts for the task. |
+| GET | `/api/threads/{id}/commands/{receiptId}` | Read one command receipt. |
+| DELETE | `/api/threads/{id}/commands/{receiptId}` | Cancel a command that has not begun dispatch. |
 | POST | `/api/threads/{id}/interrupt` | Interrupt the current bridge-controlled turn. |
+| GET | `/api/models?forceRefresh=` | List the app-server model catalog and each model's supported reasoning efforts in advertised order. |
 | GET | `/api/permissions?cwd=` | List effective permission profiles for a workspace. |
 | GET | `/api/skills?cwd=&forceReload=` | List available skills. |
 | GET | `/api/tools?threadId=` | List available MCP servers, apps, and tools. |
@@ -87,6 +97,20 @@ Task history pages are limited to 1–20 turns per request. A cached client that
 does not request cursor pagination receives HTTP 426. An older Codex app-server
 without safe turn pagination receives HTTP 501 rather than an unsafe
 full-history fallback.
+
+`POST /api/threads/{id}/messages` and `POST /api/threads/{id}/steer` accept
+optional `model` and `reasoningEffort` strings. The Bridge resolves a catalog
+preset id to its canonical model slug, requires the model to be present in the
+current `model/list` response, and requires `reasoningEffort` to appear in that
+model's advertised `supportedReasoningEfforts` list. An effort cannot be sent
+without a model. Omitting both preserves the task's existing Codex settings.
+The canonical options are stored in the durable command receipt and survive a
+Bridge restart.
+
+Codex supports `model` and `effort` overrides on `turn/start`, but not on
+`turn/steer`. Therefore a queued command with either override waits for an
+active turn to finish and then starts a fresh turn carrying those exact fields;
+the Bridge never silently steers it into a turn running a different model.
 
 ### Approvals and questions
 
@@ -140,14 +164,43 @@ does not validate after remapping.
 | GET | `/api/projects` | List recognized local projects for the project screen. |
 | GET | `/api/processes` | List the allowlisted related processes. |
 | POST | `/api/processes/{pid}/stop` | Stop an allowlisted process tree after exact `STOP <pid>` confirmation. |
+| GET | `/api/diagnostics/console-launches?limit=` | Read the bounded, aggregated console-launch audit. This route is intentionally excluded from `/api/summary`. |
+| POST | `/api/diagnostics/console-audit/capture` | Pause or resume capture with an `enabled` boolean. |
+| POST | `/api/diagnostics/console-audit/clear` | Clear in-memory records after exact `CLEAR AUDIT` confirmation. |
+
+Console audit records identify the source process, command process, window
+host, parent chain, paths, first and last observation times, count, interval,
+classification, and explanation. Command-line fields are redacted on the
+server before transmission. The audit does not persist records and does not
+itself invoke PowerShell or another terminal.
 
 ## Concurrency and ownership
 
-A task actively owned by another desktop Codex process is observable but not
-safe for bridge mutation. Mutating endpoints may reject such a request instead
-of creating competing app-server ownership. To keep the phone as the complete
-control plane, start the task from Console or continue it from Console after the
-externally owned turn has ended; the next turn is then owned by the bridge.
+A message accepted from the phone is persisted before app-server dispatch.
+Both message endpoints return HTTP 202 with this shape:
+
+```json
+{
+  "queued": true,
+  "receipt": {
+    "id": "opaque-receipt-id",
+    "status": "queued",
+    "message": "Safe user-facing status",
+    "threadId": "task-id",
+    "createdAt": "2026-07-27T02:00:00Z",
+    "updatedAt": "2026-07-27T02:00:00Z"
+  }
+}
+```
+
+Receipt states are `queued`, `dispatching`, `delivered`,
+`dispatchUncertain`, `failed`, and `cancelled`. Commands are ordered per task.
+A fresh turn owned by Codex Desktop leaves the command queued until that turn
+ends or its ownership evidence becomes stale. If the app-server disconnects
+after a request may have been written but before acknowledgement, the receipt
+becomes `dispatchUncertain`; the bridge reconciles it using the original
+`clientUserMessageId` and persisted protocol history, and never blindly replays
+it. Execution permission fields are persisted with the command unchanged.
 
 ## Compatibility and change control
 

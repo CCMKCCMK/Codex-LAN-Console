@@ -5,13 +5,18 @@ const tokenKey = 'codexLanToken';
 const turnPageSize = 6;
 const localResolutionCache = new Map();
 const remoteFileCache = new Map();
+const remoteFileRequests = CodexRemoteArtifacts.createSingleFlight();
+const threadStream = CodexThreadStream;
+const modelSettings = CodexModelSettings;
+let availableModelCatalog = modelSettings.fallbackCatalog();
 const isNativeShell = document.documentElement.classList.contains('native-shell');
 const maxAttachmentCount = 10;
 const maxAttachmentBytes = 128 * 1024 * 1024;
 const maxAttachmentRequestBytes = 256 * 1024 * 1024;
 const navigationMarker = 'codexLanConsole';
-const rootPage = 'overview';
-const primaryPages = new Set(['overview', 'threads', 'projects', 'processes', 'approvals']);
+const rootPage = 'threads';
+const primaryPages = new Set(['threads', 'remote', 'settings', 'processes', 'approvals']);
+const threadPageCacheLimit = 12;
 
 let token = localStorage.getItem(tokenKey) || '';
 let authenticated = false;
@@ -32,6 +37,7 @@ let pendingSignature = null;
 let approvalAutomation = { autoApproveAll: false, supported: true };
 let approvalAutomationBusy = false;
 let runtimeStates = {};
+let turnRecoveryStates = {};
 let allowedPermissionProfiles = new Set([':read-only', ':workspace', ':danger-full-access']);
 let permissionsLoadedFor = '';
 let availableSkills = [];
@@ -52,19 +58,44 @@ let riskResolver = null;
 let summaryLoadPromise = null;
 let lastSummaryRefreshAt = 0;
 let lastApprovalSettingsRefreshAt = 0;
+let consoleAuditState = { supported: true, capturing: false, events: [] };
+let consoleAuditLoading = false;
+let administratorMode = { detected: false, active: false, scope: 'bridgeOwnedTasksOnly' };
+let browserStatus = { state: 'checking', installed: false, running: false, starting: false, autoStartWithBridge: true };
+let browserBusy = false;
+let remoteWorkBusy = false;
+let newTaskBusy = false;
 const latestThreadRequests = new Map();
 const lastThreadRefreshAt = new Map();
+const threadPageCache = new Map();
+const threadRetryStates = new Map();
 const attachmentDrafts = new Map();
+let currentThreadLoadError = null;
+let livePollController = null;
+let livePollThread = '';
+let liveRevision = 0;
+let liveFeedFailures = 0;
+let liveFullRefreshAttempts = 0;
+let forceFollowNextRender = false;
+let newMessageCount = 0;
+let lastDeliveryReceipt = null;
+let currentThreadHasRendered = false;
+const renderedTurnSignatures = new Map();
+const renderedBlockSignatures = new Map();
+let directScrollInteractionUntil = 0;
+let directScrollInteractionRevision = 0;
 
 function apiError(path, method, status, data, raw, response, suppressDiagnostic = false) {
   const fallback = status ? `请求失败 ${status}` : '无法连接电脑端服务';
-  const message = data?.error || data?.message || fallback;
+  const message = CodexThreadResilience.messageFromPayload(data, fallback);
   const error = new Error(message);
   error.status = status;
   error.path = path;
   error.method = method;
   error.requestId = response?.headers?.get('X-Request-ID') || data?.requestId || data?.traceId || '';
-  error.detail = data?.detail || data?.details || raw || '';
+  error.kind = data?.kind || (status ? 'httpError' : 'networkError');
+  error.code = data?.code ?? null;
+  error.detail = CodexThreadResilience.detailFromPayload(data, raw);
   if (!suppressDiagnostic && (!status || status >= 500)) showDiagnostic(error);
   return error;
 }
@@ -73,8 +104,12 @@ async function apiRequest(path, options = {}, form = false) {
   const headers = { ...(options.headers || {}) };
   if (token) headers.Authorization = `Bearer ${token}`;
   const suppressDiagnostic = Boolean(options.suppressDiagnostic);
+  const timeoutMs = CodexThreadResilience.requestTimeout(options.method, path, options.timeoutMs);
+  const deadline = CodexThreadResilience.createRequestDeadline(options.signal, timeoutMs);
   const request = { ...options, headers, credentials: 'same-origin' };
   delete request.suppressDiagnostic;
+  delete request.timeoutMs;
+  request.signal = deadline.signal;
   if (!form && options.body !== undefined) {
     headers['Content-Type'] = 'application/json';
     request.body = JSON.stringify(options.body);
@@ -84,8 +119,16 @@ async function apiRequest(path, options = {}, form = false) {
   try {
     response = await fetch('/api' + path, request);
   } catch (cause) {
-    const error = apiError(path, method, 0, null, cause?.message || String(cause), null, suppressDiagnostic);
+    const timedOut = deadline.timedOut();
+    const error = apiError(path, method, 0, null, cause?.message || String(cause), null, suppressDiagnostic || timedOut);
+    if (timedOut) {
+      error.message = '电脑端响应超时，系统会继续刷新任务状态';
+      error.kind = 'timeout';
+      error.code = 'REQUEST_TIMEOUT';
+      if (!suppressDiagnostic) showDiagnostic(error);
+    }
     error.cause = cause;
+    deadline.dispose();
     throw error;
   }
   if (response.status === 401) {
@@ -95,16 +138,33 @@ async function apiRequest(path, options = {}, form = false) {
     error.status = 401;
     error.path = path;
     error.method = method;
+    deadline.dispose();
     throw error;
   }
-  const raw = response.status === 204 ? '' : await response.text();
+  let raw = '';
+  try {
+    raw = response.status === 204 ? '' : await response.text();
+  } catch (cause) {
+    const timedOut = deadline.timedOut();
+    const error = apiError(path, method, 0, null, cause?.message || String(cause), response, suppressDiagnostic || timedOut);
+    if (timedOut) {
+      error.message = '电脑端响应超时，系统会继续刷新任务状态';
+      error.kind = 'timeout';
+      error.code = 'REQUEST_TIMEOUT';
+      if (!suppressDiagnostic) showDiagnostic(error);
+    }
+    deadline.dispose();
+    throw error;
+  }
+  deadline.dispose();
   let data = null;
+  let parsedJson = false;
   if (raw) {
-    try { data = JSON.parse(raw); }
+    try { data = JSON.parse(raw); parsedJson = true; }
     catch { data = null; }
   }
   if (!response.ok) {
-    throw apiError(path, method, response.status, data, raw, response, suppressDiagnostic);
+    throw apiError(path, method, response.status, data, parsedJson ? '' : raw, response, suppressDiagnostic);
   }
   return data;
 }
@@ -114,26 +174,48 @@ async function api(path, options = {}) {
 }
 
 async function apiForm(path, formData) {
-  return apiRequest(path, { method: 'POST', body: formData }, true);
+  return apiRequest(path, { method: 'POST', body: formData, timeoutMs: 180000 }, true);
 }
 
 function showDiagnostic(error) {
   const panel = $('#diagnostic');
   if (!panel) return;
   const status = error.status || 'NETWORK';
-  const title = error.status >= 500 ? '电脑端处理失败' : '无法连接电脑端';
+  const isThreadRead = error.method === 'GET' && String(error.path || '').startsWith('/threads/');
+  const title = isThreadRead
+    ? '暂时无法读取任务'
+    : error.status >= 500 ? '电脑端处理失败' : '无法连接电脑端';
+  const userMessage = isThreadRead
+    ? '最新消息暂时没有读取成功。已有内容会保留，系统也会自动重试。'
+    : error.status === 504 || error.kind === 'timeout'
+      ? '电脑端响应超时，请稍后重试。'
+      : error.kind === 'codexUnavailable'
+        ? '电脑端 Codex 暂时不可用，请稍后重试。'
+        : '这次操作没有完成。你可以重试，诊断编号已保留。';
   const details = {
     time: new Date().toISOString(),
     status,
+    kind: error.kind || 'unknown',
+    code: error.code,
     method: error.method || 'UNKNOWN',
     endpoint: error.path ? `/api${error.path}` : 'unknown',
     requestId: error.requestId || 'not provided',
     detail: String(error.detail || error.message || '').slice(0, 4000)
   };
   $('#diagnosticTitle').textContent = title;
-  $('#diagnosticMessage').textContent = error.message || '操作没有完成。诊断信息已保留。';
-  lastDiagnosticText = JSON.stringify(details, null, 2);
+  $('#diagnosticMessage').textContent = userMessage;
+  const conciseDetails = [
+    `错误类型：${details.kind}`,
+    `状态代码：${details.status}${details.code === null ? '' : ` / ${details.code}`}`,
+    `请求编号：${details.requestId}`,
+    `请求位置：${details.method} ${details.endpoint}`,
+    `发生时间：${new Date().toLocaleString()}`,
+    ...(details.detail ? [`说明：${details.detail}`] : [])
+  ];
+  lastDiagnosticText = conciseDetails.join('\n');
   $('#diagnosticDetails').textContent = lastDiagnosticText;
+  const disclosure = $('#diagnosticDetails').closest('details');
+  if (disclosure) disclosure.open = false;
   panel.classList.remove('hidden');
 }
 
@@ -331,16 +413,22 @@ async function enableNativeNotifications() {
 
 function openNotificationThread(threadId) {
   const id = String(threadId || '').trim();
+  if (id === 'commute') {
+    window.location.assign('/commute/');
+    return true;
+  }
   if (!id) {
     showPage('threads');
     load();
     return true;
   }
-  openThread(id).catch(error => toast(error.message));
+  openTask(id).catch(error => toast(error.message));
   return true;
 }
 
 window.CodexConsoleOpenThread = openNotificationThread;
+// Kept separate from UI/task navigation: old Android shells replay this hook.
+window.openThread = async id => window.ConsoleNotificationNavigation.legacy(id);
 window.addEventListener('codex-notification-open', event => openNotificationThread(event.detail?.threadId));
 window.addEventListener('codex-notification-status', event => refreshNativeNotificationStatus(event.detail));
 
@@ -392,7 +480,7 @@ const fileExtensions = new Set([
   'txt', 'md', 'json', 'xml', 'yaml', 'yml', 'html', 'htm', 'css', 'js', 'mjs', 'cjs', 'ts', 'tsx',
   'jsx', 'py', 'java', 'kt', 'kts', 'cs', 'cpp', 'c', 'h', 'hpp', 'go', 'rs', 'sh', 'ps1', 'bat',
   'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'heic', 'mp4', 'webm', 'mov', 'mkv', 'avi',
-  'mp3', 'wav', 'm4a', 'ogg', 'log'
+  'mp3', 'wav', 'm4a', 'ogg', 'log', 'cer', 'crt', 'der'
 ]);
 
 function decodedReference(value) {
@@ -412,6 +500,7 @@ function fileReference(rawValue) {
       if (/^\/[A-Za-z]:\//.test(value)) value = value.slice(1);
     } catch { return ''; }
   }
+  value = CodexRemoteArtifacts.normalizeReferencePath(value);
   value = value.replace(/:(\d+)(?::\d+)?$/, '');
   const clean = value.split(/[?#]/, 1)[0];
   const extension = clean.match(/\.([A-Za-z0-9]{1,8})$/)?.[1]?.toLowerCase();
@@ -438,7 +527,7 @@ function markRemoteFile(element, path, image = false) {
 }
 
 function linkifyFileText(root) {
-  const pattern = /(?:(?:sandbox:\/+|file:\/\/\/|[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]|\/(?:mnt\/data|home|tmp|workspace|Users|var\/tmp)\/|\.{1,2}[\\/]|(?:[\w.-]+[\\/]))[^\n<>"'`]*?\.|[\p{L}\p{N}_-][\p{L}\p{N}_.-]*\.)(?:apk|aab|zip|7z|rar|pdf|docx?|xlsx?|csv|pptx?|txt|md|json|xml|ya?ml|html?|css|m?js|cjs|tsx?|jsx|py|java|kts?|cs|cpp|c|h|hpp|go|rs|sh|ps1|bat|png|jpe?g|gif|webp|svg|bmp|heic|mp4|webm|mov|mkv|avi|mp3|wav|m4a|ogg|log)(?=(?::\d+(?::\d+)?)?(?:[\s)\],;.!?]|$))/giu;
+  const pattern = /(?:(?:sandbox:\/+|file:\/\/\/|[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]|\/(?:mnt\/data|home|tmp|workspace|Users|var\/tmp)\/|\.{1,2}[\\/]|(?:[\w.-]+[\\/]))[^\n<>"'`]*?\.|[\p{L}\p{N}_-][\p{L}\p{N}_.-]*\.)(?:apk|aab|zip|7z|rar|pdf|docx?|xlsx?|csv|pptx?|txt|md|json|xml|ya?ml|html?|css|m?js|cjs|tsx?|jsx|py|java|kts?|cs|cpp|c|h|hpp|go|rs|sh|ps1|bat|png|jpe?g|gif|webp|svg|bmp|heic|mp4|webm|mov|mkv|avi|mp3|wav|m4a|ogg|log|cer|crt|der)(?=(?::\d+(?::\d+)?)?(?:[\s)\],;.!?]|$))/giu;
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
   const nodes = [];
   while (walker.nextNode()) {
@@ -471,7 +560,7 @@ function linkifyFileText(root) {
 }
 
 function markdown(text) {
-  const source = String(text || '').replace(/</g, '&lt;');
+  const source = CodexRemoteArtifacts.escapeMarkdownHtmlPreservingFileLinks(text);
   if (!window.marked) return esc(source).replace(/\n/g, '<br>');
   const template = document.createElement('template');
   template.innerHTML = window.marked.parse(source, { gfm: true, breaks: true });
@@ -572,7 +661,17 @@ async function prepareLocalResources(root) {
     ...images.map(async image => {
     image.dataset.resolving = 'true';
     try {
-      image.src = await resolveLocalLink(image.dataset.localUrl);
+      const resolvedUrl = await resolveLocalLink(image.dataset.localUrl);
+      const snapshot = image.closest?.('#turns') ? captureThreadScrollSnapshot() : null;
+      if (snapshot) {
+        const settle = () => restoreThreadScrollSnapshot(
+          snapshot,
+          snapshot.wasAtBottom && !snapshot.userInteracting
+        );
+        image.addEventListener('load', settle, { once: true });
+        image.addEventListener('error', settle, { once: true });
+      }
+      image.src = resolvedUrl;
       image.loading = 'lazy';
       image.classList.remove('local-image-pending');
       image.removeAttribute('aria-busy');
@@ -580,7 +679,7 @@ async function prepareLocalResources(root) {
       const replacement = document.createElement('span');
       replacement.className = 'local-resource-error';
       replacement.textContent = image.alt ? `图片无法打开：${image.alt}` : '远程图片暂时无法打开';
-      image.replaceWith(replacement);
+      replaceRichResource(image, replacement);
     }
     })
   ]);
@@ -601,14 +700,7 @@ function formatBytes(value) {
 }
 
 function artifactKind(file) {
-  const mime = String(file.mime || file.contentType || '').toLowerCase();
-  const extension = String(file.name || file.path || '').split('.').pop()?.toLowerCase();
-  if (mime.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'heic'].includes(extension)) return 'image';
-  if (mime.startsWith('video/') || ['mp4', 'webm', 'mov', 'mkv', 'avi'].includes(extension)) return 'video';
-  if (extension === 'apk' || extension === 'aab') return 'android';
-  if (extension === 'pdf') return 'pdf';
-  if (['zip', '7z', 'rar'].includes(extension)) return 'archive';
-  return file.kind || 'file';
+  return CodexRemoteArtifacts.artifactKind(file);
 }
 
 function artifactHint(file) {
@@ -616,6 +708,7 @@ function artifactHint(file) {
     case 'android': return '下载到手机后，在文件管理中打开安装；如系统提示，请仅为当前文件来源授予安装权限。';
     case 'pdf': return '可以直接预览，也可以下载后交给其他应用打开。';
     case 'archive': return '下载后解压；不要直接运行来源不明的压缩包内容。';
+    case 'certificate': return '这是公开 CA 证书。下载后可在 Android 的证书安装页面选择并安装；私钥文件不会通过这里提供。';
     case 'image': return '点击图片可查看原图，也可以保存到手机。';
     case 'video': return '可在线播放；网络不稳定时建议先下载。';
     default: return '可直接打开查看，或下载到手机后交给相应应用处理。';
@@ -623,18 +716,30 @@ function artifactHint(file) {
 }
 
 async function resolveRemoteFile(path, threadId = currentThread) {
-  const key = `${threadId || ''}\n${path}`;
+  const normalizedPath = CodexRemoteArtifacts.normalizeReferencePath(path);
+  const key = CodexRemoteArtifacts.cacheKey(threadId, normalizedPath);
   const cached = remoteFileCache.get(key);
   if (cached && cached.expiresAt > Date.now() + 30000) return cached.file;
-  const result = await api('/files/register', { method: 'POST', body: { path, threadId: threadId || null } });
-  const file = result?.file || result || {};
-  file.name ||= path.split(/[\\/]/).filter(Boolean).pop() || '交付文件';
-  file.path ||= path;
-  file.viewUrl ||= file.url || file.contentUrl || file.downloadUrl;
-  file.downloadUrl ||= file.url || file.viewUrl;
-  const expiresAt = Date.parse(file.expiresAt || result?.expiresAt || '') || Date.now() + 8 * 60 * 1000;
-  remoteFileCache.set(key, { file, expiresAt });
-  return file;
+  return remoteFileRequests.run(key, async () => {
+    const result = await api('/files/register', {
+      method: 'POST',
+      body: { path: normalizedPath, threadId: threadId || null },
+      suppressDiagnostic: true
+    });
+    const file = result?.file || result || {};
+    file.name ||= CodexRemoteArtifacts.displayName(normalizedPath);
+    file.path ||= normalizedPath;
+    file.viewUrl ||= file.url || file.contentUrl || file.downloadUrl;
+    file.downloadUrl ||= file.url || file.viewUrl;
+    if (!file.viewUrl && !file.downloadUrl) {
+      const error = new Error('电脑端没有返回可用的文件地址。');
+      error.status = 502;
+      throw error;
+    }
+    const expiresAt = Date.parse(file.expiresAt || result?.expiresAt || '') || Date.now() + 8 * 60 * 1000;
+    remoteFileCache.set(key, { file, expiresAt });
+    return file;
+  });
 }
 
 function artifactCard(file, label, includePreview = false) {
@@ -644,7 +749,7 @@ function artifactCard(file, label, includePreview = false) {
   heading.className = 'artifact-heading';
   const icon = document.createElement('span');
   icon.className = 'artifact-icon';
-  icon.textContent = ({ android: 'APK', pdf: 'PDF', archive: 'ZIP', image: 'IMG', video: 'VID' })[artifactKind(file)] || 'FILE';
+  icon.textContent = ({ android: 'APK', pdf: 'PDF', archive: 'ZIP', certificate: 'CER', image: 'IMG', video: 'VID' })[artifactKind(file)] || 'FILE';
   const copy = document.createElement('span');
   copy.className = 'artifact-copy';
   const title = document.createElement('b');
@@ -665,6 +770,12 @@ function artifactCard(file, label, includePreview = false) {
       image.src = file.viewUrl;
       image.alt = label || file.name || '交付图片';
       image.loading = 'lazy';
+      image.addEventListener('error', () => {
+        const unavailable = document.createElement('small');
+        unavailable.className = 'artifact-preview-error';
+        unavailable.textContent = '预览没有加载成功，仍可使用下方按钮打开或下载原文件。';
+        image.replaceWith(unavailable);
+      }, { once: true });
       card.append(image);
     } else if (kind === 'video') {
       const video = document.createElement('video');
@@ -682,11 +793,12 @@ function artifactCard(file, label, includePreview = false) {
   card.append(hint);
   const actions = document.createElement('span');
   actions.className = 'artifact-actions';
-  if (file.viewUrl && !['android', 'archive'].includes(kind)) {
+  if (file.viewUrl && !['android', 'archive', 'certificate'].includes(kind)) {
     const open = document.createElement('a');
     open.className = 'artifact-open';
     open.href = file.viewUrl;
     open.textContent = '打开';
+    open.dataset.artifactAction = 'open';
     open.rel = 'noopener noreferrer';
     if (!isNativeShell) open.target = '_blank';
     actions.append(open);
@@ -696,32 +808,80 @@ function artifactCard(file, label, includePreview = false) {
     download.className = 'artifact-download';
     download.href = file.downloadUrl;
     download.download = file.name || '';
-    download.textContent = kind === 'android' ? '下载 APK' : '下载';
+    download.textContent = kind === 'android' ? '下载 APK' : kind === 'certificate' ? '下载证书' : '下载';
+    download.dataset.artifactAction = 'download';
     actions.append(download);
   }
   card.append(actions);
   return card;
 }
 
+function artifactUnavailable(path, threadId, error) {
+  const presentation = CodexRemoteArtifacts.failurePresentation(error, path);
+  const replacement = document.createElement('span');
+  replacement.className = 'artifact-unavailable';
+  replacement.dataset.filePath = path;
+  replacement.dataset.fileThread = threadId || '';
+  replacement.dataset.fileFailed = 'true';
+  replacement.setAttribute('role', 'status');
+  const copy = document.createElement('span');
+  copy.className = 'artifact-unavailable-copy';
+  const title = document.createElement('b');
+  title.textContent = presentation.title;
+  const detail = document.createElement('small');
+  detail.textContent = presentation.detail;
+  copy.append(title, detail);
+  const retry = document.createElement('button');
+  retry.type = 'button';
+  retry.className = 'artifact-retry';
+  retry.textContent = '重试读取';
+  replacement.append(copy, retry);
+  return replacement;
+}
+
+function replaceRichResource(element, replacement) {
+  const preserveScroll = Boolean(element?.closest?.('#turns'));
+  const snapshot = preserveScroll ? captureThreadScrollSnapshot() : null;
+  element.replaceWith(replacement);
+  if (snapshot) {
+    const follow = snapshot.wasAtBottom && !snapshot.userInteracting;
+    restoreThreadScrollSnapshot(snapshot, follow);
+    const imageSnapshot = captureThreadScrollSnapshot();
+    const descendants = replacement.querySelectorAll?.('img') || [];
+    const images = replacement.matches?.('img') ? [replacement] : [...descendants];
+    images.filter(image => !image.complete).forEach(image => {
+      const settle = () => restoreThreadScrollSnapshot(
+        imageSnapshot,
+        imageSnapshot.wasAtBottom && !imageSnapshot.userInteracting
+      );
+      image.addEventListener('load', settle, { once: true });
+      image.addEventListener('error', settle, { once: true });
+    });
+  }
+}
+
+async function prepareRemoteFile(element) {
+  if (!element || element.dataset.fileResolving === 'true') return;
+  element.dataset.fileResolving = 'true';
+  const path = element.dataset.filePath;
+  const threadId = element.dataset.fileThread || currentThread;
+  try {
+    const file = await resolveRemoteFile(path, threadId);
+    const imageElement = element.tagName === 'IMG';
+    replaceRichResource(element, artifactCard(file, imageElement ? element.alt : element.textContent, imageElement));
+  } catch (error) {
+    replaceRichResource(element, artifactUnavailable(path, threadId, error));
+  } finally {
+    delete element.dataset.fileResolving;
+  }
+}
+
 async function prepareRemoteFiles(root) {
   if (!root) return;
-  const elements = [...root.querySelectorAll('[data-file-path]:not([data-file-resolving])')];
-  await Promise.all(elements.map(async element => {
-    element.dataset.fileResolving = 'true';
-    const path = element.dataset.filePath;
-    const threadId = element.dataset.fileThread || currentThread;
-    try {
-      const file = await resolveRemoteFile(path, threadId);
-      const imageElement = element.tagName === 'IMG';
-      element.replaceWith(artifactCard(file, imageElement ? element.alt : element.textContent, imageElement));
-    } catch (error) {
-      const replacement = document.createElement('span');
-      replacement.className = 'artifact-unavailable';
-      replacement.textContent = `${path.split(/[\\/]/).pop() || '文件'} 暂时无法从远程电脑读取`;
-      replacement.title = error.message || '';
-      element.replaceWith(replacement);
-    }
-  }));
+  const elements = [...root.querySelectorAll(
+    '[data-file-path]:not([data-file-resolving]):not([data-file-failed])'
+  )];
+  await Promise.all(elements.map(prepareRemoteFile));
 }
 
 async function prepareRichResources(root) {
@@ -729,6 +889,31 @@ async function prepareRichResources(root) {
 }
 
 document.addEventListener('click', async event => {
+  const retry = event.target.closest?.('.artifact-retry');
+  if (retry) {
+    event.preventDefault();
+    const unavailable = retry.closest('.artifact-unavailable');
+    if (!unavailable || retry.disabled) return;
+    const key = CodexRemoteArtifacts.cacheKey(
+      unavailable.dataset.fileThread || currentThread,
+      unavailable.dataset.filePath
+    );
+    remoteFileCache.delete(key);
+    retry.disabled = true;
+    retry.textContent = '正在读取…';
+    delete unavailable.dataset.fileFailed;
+    await prepareRemoteFile(unavailable);
+    return;
+  }
+
+  const artifactAction = event.target.closest?.('a[data-artifact-action]');
+  if (artifactAction) {
+    toast(artifactAction.dataset.artifactAction === 'download'
+      ? '正在从远程电脑下载'
+      : '正在打开远程电脑上的文件');
+    return;
+  }
+
   const anchor = event.target.closest?.('a[data-local-url]');
   if (!anchor) return;
   event.preventDefault();
@@ -750,14 +935,40 @@ document.addEventListener('click', async event => {
   }
 });
 
-function toolLabel(type) {
-  if (/command|exec|shell|terminal/i.test(type)) return '运行命令';
-  if (/fileChange|patch|edit/i.test(type)) return '编辑文件';
-  if (/image|screenshot|viewImage/i.test(type)) return '查看图片';
-  if (/search|web/i.test(type)) return '搜索网络';
-  if (/computer|browser/i.test(type)) return '操作界面';
-  if (/agent|collab/i.test(type)) return '调用子 Agent';
-  return '调用工具';
+function compactProcessText(value, maximum = 54) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  return text.length > maximum ? `${text.slice(0, maximum - 1)}…` : text;
+}
+
+function pathBasename(value) {
+  return String(value || '').split(/[\\/]/).filter(Boolean).pop() || '';
+}
+
+function toolPresentation(type, item, status) {
+  const state = processStatusLabel(status);
+  const hint = [type, item?.name, item?.tool, item?.server, item?.method].filter(Boolean).join(' ');
+  if (/fileChange|patch|edit/i.test(type)) {
+    const files = [...new Set((item?.changes || []).map(change => pathBasename(change?.path || change?.filePath)).filter(Boolean))];
+    const target = files.length === 1 ? ` ${files[0]}` : files.length > 1 ? ` ${files.length} 个文件` : '';
+    return { category: 'file', label: `${state === '完成' ? '已编辑' : state === '进行中' ? '正在编辑' : '编辑'}${target}` };
+  }
+  if (/command|exec|shell|terminal/i.test(type)) {
+    return { category: 'command', label: state === '完成' ? '已运行命令' : state === '进行中' ? '正在运行命令' : '运行命令' };
+  }
+  if (/image|screenshot|viewImage/i.test(hint)) {
+    return { category: 'image', label: state === '完成' ? '已查看图片' : '查看图片' };
+  }
+  if (/computer|browser/i.test(hint)) {
+    return { category: 'browser', label: state === '完成' ? '已操作界面' : '操作界面' };
+  }
+  if (/search|web/i.test(hint)) {
+    return { category: 'search', label: state === '完成' ? '已搜索网络' : '搜索网络' };
+  }
+  if (/agent|collab/i.test(hint)) {
+    return { category: 'agent', label: state === '完成' ? '已调用子 Agent' : '调用子 Agent' };
+  }
+  const name = compactProcessText(item?.tool || item?.name || '', 30);
+  return { category: 'tool', label: name ? `调用 ${name}` : '调用工具' };
 }
 
 function userResourceMarkup(item) {
@@ -785,55 +996,476 @@ function presentItem(item) {
     const text = itemText(parsed) || itemText(item);
     const nested = parsedPayload({ text });
     if (nested !== parsed && nested?.type && nested.type !== 'agentMessage') return presentItem(nested);
-    return { kind: 'message', role: 'assistant', text };
+    return { kind: 'message', role: 'assistant', text, phase: String(parsed.phase || item.phase || '') };
   }
   if (type === 'reasoning') return { kind: 'reasoning', text: plainSummary(parsed.summary) || '正在分析' };
-  return { kind: 'tool', label: toolLabel(type) };
+  if (type === 'plan') return { kind: 'reasoning', text: itemText(parsed) || '更新计划' };
+  const status = String(parsed.status || item.status || '');
+  const presentation = toolPresentation(type, parsed, status);
+  return { kind: 'tool', ...presentation, status };
 }
 
-function renderTurn(turn) {
+function processStatusLabel(status) {
+  const value = String(status || '').toLowerCase();
+  if (/fail|error|declin|cancel/.test(value)) return '失败';
+  if (/progress|running|start|pending/.test(value)) return '进行中';
+  if (/complete|success|applied|exit/.test(value)) return '完成';
+  return '';
+}
+
+function processingDuration(turn) {
+  let milliseconds = Number(turn?.durationMs || 0);
+  if (!milliseconds && turn?.startedAt) {
+    const end = turn.completedAt ? Number(turn.completedAt) * 1000 : Date.now();
+    milliseconds = Math.max(0, end - Number(turn.startedAt) * 1000);
+  }
+  if (!milliseconds) return '';
+  const seconds = Math.floor(milliseconds / 1000);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  return [hours ? `${hours}h` : '', minutes ? `${minutes}m` : '', `${rest}s`].filter(Boolean).join(' ');
+}
+
+function timestampMilliseconds(value) {
+  if (value === null || value === undefined || value === '') return NaN;
+  if (typeof value === 'number' || /^\d+(?:\.\d+)?$/.test(String(value))) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number <= 0) return NaN;
+    return number < 100_000_000_000 ? number * 1000 : number;
+  }
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function formattedEventTime(value) {
+  const milliseconds = timestampMilliseconds(value);
+  if (!Number.isFinite(milliseconds)) return null;
+  const date = new Date(milliseconds);
+  const now = new Date();
+  const sameDay = date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+  const label = new Intl.DateTimeFormat('zh-CN', sameDay
+    ? { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }
+    : { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }
+  ).format(date);
+  return { label, iso: date.toISOString() };
+}
+
+function itemEventTime(item, view, turn) {
+  const direct = item?.createdAt ?? item?.timestamp ?? item?.updatedAt;
+  if (Number.isFinite(timestampMilliseconds(direct))) return direct;
+  if (view?.role === 'user') return turn?.startedAt;
+  if (view?.role === 'assistant' && /final/i.test(String(view?.phase || '')))
+    return turn?.completedAt;
+  return null;
+}
+
+function timeMarkup(value, className = 'message-time') {
+  const formatted = formattedEventTime(value);
+  return formatted
+    ? `<time class="${esc(className)}" datetime="${esc(formatted.iso)}">${esc(formatted.label)}</time>`
+    : '';
+}
+
+function turnStatusLabel(turn) {
+  const status = String(turn?.status?.type || turn?.status || '').toLowerCase();
+  if (status === 'inprogress' || status === 'running') return '运行中';
+  if (status === 'completed') return '已完成';
+  if (/interrupt|abort|cancel/.test(status)) return '已停止';
+  if (/fail|error/.test(status)) return '失败';
+  return '';
+}
+
+function renderProcessed(entries, turn, key, openKeys) {
+  if (!entries.length) return '';
+  const items = entries.map(entry => entry.view);
+  const running = turnStatusLabel(turn) === '运行中';
+  const duration = processingDuration(turn);
+  const reasoning = [...items].reverse().find(view => view.kind === 'reasoning' && view.text && view.text !== '正在分析');
+  const title = compactProcessText(reasoning?.text || (running ? '正在处理' : '已处理'));
+  const meta = [`${items.length} 项`, duration].filter(Boolean).join(' · ');
+  const icons = { reasoning: '◇', command: '›_', file: '✎', image: '▧', browser: '◎', search: '⌕', agent: '◈', tool: '◆' };
+  const body = entries.map(({ view, item }) => {
+    const eventTime = timeMarkup(item?.createdAt ?? item?.timestamp ?? item?.updatedAt, 'process-time');
+    if (view.kind === 'reasoning') {
+      return `<div class="process-step process-reasoning"><span class="process-icon">${icons.reasoning}</span>` +
+        `<div class="process-copy markdown-body">${markdown(view.text)}</div>${eventTime}</div>`;
+    }
+    const status = processStatusLabel(view.status);
+    const statusClass = status === '失败' ? ' failed' : status === '进行中' ? ' running' : '';
+    return `<div class="process-step${statusClass}"><span class="process-icon">${esc(icons[view.category] || icons.tool)}</span>` +
+      `<span class="process-label">${esc(view.label)}</span><span class="process-tail">` +
+      `${status ? `<span class="process-state">${esc(status)}</span>` : ''}${eventTime}</span></div>`;
+  }).join('');
+  return `<details class="processed" data-block-key="${esc(key)}" data-process-key="${esc(key)}"${openKeys.has(key) ? ' open' : ''}>` +
+    `<summary><strong>${esc(title)}</strong><span>${esc(meta)}</span><i aria-hidden="true">›</i></summary>` +
+    `<div class="processed-body">${body}</div></details>`;
+}
+
+function renderTurnBlocks(turn, turnIndex, openKeys) {
   const blocks = [];
-  const pendingTools = [];
-  const flushTools = () => {
-    if (!pendingTools.length) return;
-    const counts = new Map();
-    for (const item of pendingTools) counts.set(item.label, (counts.get(item.label) || 0) + 1);
-    blocks.push(`<div class="activity">${[...counts].map(([label, count]) =>
-      `<span>${esc(label)}${count > 1 ? ` × ${count}` : ''}</span>`).join('')}</div>`);
-    pendingTools.length = 0;
+  const pendingProcess = [];
+  const turnKey = String(turn?.id || `turn-${turnIndex}`);
+  const turnTime = formattedEventTime(turn?.startedAt ?? turn?.completedAt);
+  const turnStatus = turnStatusLabel(turn);
+  if (turnTime || turnStatus) {
+    const statusAndDuration = [turnStatus, processingDuration(turn)].filter(Boolean).join(' · ');
+    blocks.push({
+      key: 'turn-meta',
+      signature: JSON.stringify({
+        status: turn?.status,
+        startedAt: turn?.startedAt,
+        completedAt: turn?.completedAt,
+        durationMs: turn?.durationMs
+      }),
+      html: () => `<div class="turn-meta" data-block-key="turn-meta">` +
+        `${turnTime ? `<time datetime="${esc(turnTime.iso)}">${esc(turnTime.label)}</time>` : ''}` +
+        `${statusAndDuration ? `<span>${esc(statusAndDuration)}</span>` : ''}</div>`
+    });
+  }
+  const flushProcess = () => {
+    if (!pendingProcess.length) return;
+    const entries = pendingProcess.slice();
+    const first = pendingProcess[0];
+    const blockKey = `process:${first.itemKey}`;
+    const processKey = `${turnKey}:${blockKey}`;
+    const sourceItems = pendingProcess.map(entry => entry.item);
+    const signature = JSON.stringify({
+      items: sourceItems,
+      status: turn?.status,
+      startedAt: turn?.startedAt,
+      completedAt: turn?.completedAt,
+      durationMs: turn?.durationMs
+    });
+    blocks.push({
+      key: blockKey,
+      signature,
+      html: () => renderProcessed(entries, turn, processKey, openKeys)
+    });
+    pendingProcess.length = 0;
   };
 
-  for (const item of turn.items || []) {
+  (turn.items || []).forEach((item, itemIndex) => {
     const view = presentItem(item);
-    if (view.kind === 'tool') {
-      pendingTools.push(view);
-      continue;
+    const itemKey = threadStream.itemRenderKey(item, itemIndex);
+    if (view.kind === 'tool' || view.kind === 'reasoning') {
+      pendingProcess.push({ view, item, itemKey });
+      return;
     }
-    flushTools();
-    if (view.kind === 'reasoning') {
-      blocks.push(`<div class="reasoning-note markdown-body">${markdown(view.text)}</div>`);
-    } else if (view.text.trim() || view.resources) {
-      blocks.push(`<div class="turn ${view.role} markdown-body">${markdown(view.text)}${view.resources || ''}</div>`);
+    flushProcess();
+    if (view.text.trim() || view.resources) {
+      const phase = view.role === 'assistant' && view.phase ? ` phase-${view.phase.replace(/[^a-z0-9_-]/gi, '')}` : '';
+      const blockKey = `message:${itemKey}`;
+      blocks.push({
+        key: blockKey,
+        signature: JSON.stringify(item),
+        html: () => `<div class="turn ${view.role}${phase} markdown-body" data-block-key="${esc(blockKey)}">` +
+          `${markdown(view.text)}${view.resources || ''}` +
+          `${timeMarkup(itemEventTime(item, view, turn))}</div>`
+      });
     }
-  }
-  flushTools();
-  return blocks.join('');
+  });
+  flushProcess();
+  return blocks;
 }
 
-function renderThreadHistory(preserve = false) {
+function renderedBlock(html) {
+  const template = document.createElement('template');
+  template.innerHTML = html.trim();
+  return template.content.firstElementChild;
+}
+
+function reconcileTurnGroup(group, turn, turnIndex, openKeys) {
+  const turnKey = String(turn?.id || `turn-index-${turnIndex}`);
+  const blocks = renderTurnBlocks(turn, turnIndex, openKeys);
+  const existing = new Map([...group.querySelectorAll(':scope > [data-block-key]')]
+    .map(block => [block.dataset.blockKey, block]));
+  const wanted = new Set();
+  const changedNodes = [];
+  let cursor = group.firstElementChild;
+
+  for (const block of blocks) {
+    const signatureKey = `${currentThread}:${turnKey}:${block.key}`;
+    wanted.add(block.key);
+    let node = existing.get(block.key) || null;
+    if (!node) {
+      node = renderedBlock(block.html());
+      if (!node) continue;
+      group.insertBefore(node, cursor);
+      renderedBlockSignatures.set(signatureKey, block.signature);
+      changedNodes.push(node);
+    } else {
+      if (node !== cursor) group.insertBefore(node, cursor);
+      if (renderedBlockSignatures.get(signatureKey) !== block.signature) {
+        const replacement = renderedBlock(block.html());
+        if (replacement) {
+          node.replaceWith(replacement);
+          node = replacement;
+          changedNodes.push(node);
+        }
+        renderedBlockSignatures.set(signatureKey, block.signature);
+      }
+    }
+    cursor = node.nextElementSibling;
+  }
+
+  for (const [key, node] of existing) {
+    if (wanted.has(key)) continue;
+    renderedBlockSignatures.delete(`${currentThread}:${turnKey}:${key}`);
+    node.remove();
+  }
+  return changedNodes;
+}
+
+function scrollMetrics(scrolling = document.scrollingElement || document.documentElement) {
+  return {
+    scrollHeight: scrolling.scrollHeight,
+    scrollTop: scrolling.scrollTop,
+    clientHeight: scrolling.clientHeight
+  };
+}
+
+function isDirectScrollInteractionActive() {
+  return Date.now() < directScrollInteractionUntil;
+}
+
+function threadVisibleTop() {
+  const sticky = [document.querySelector('header'), $('#autoApproveBanner')]
+    .filter(element => element && !element.classList.contains('hidden'));
+  return sticky.reduce((bottom, element) => Math.max(bottom, element.getBoundingClientRect().bottom), 0);
+}
+
+function blockScrollKey(block) {
+  const turnKey = block.closest('.turn-group')?.dataset.turnKey || '';
+  return `${turnKey}\n${block.dataset.blockKey || ''}`;
+}
+
+function captureThreadScrollSnapshot() {
   const scrolling = document.scrollingElement || document.documentElement;
-  const oldHeight = scrolling.scrollHeight;
-  const oldTop = scrolling.scrollTop;
-  const earlier = hasEarlierTurns
-    ? '<button class="load-older" type="button" onclick="loadOlder()">加载更早消息</button>'
-    : '';
-  const messages = currentTurns.map(renderTurn).join('');
-  $('#turns').innerHTML = earlier + (messages || empty('任务还没有可显示的对话'));
-  prepareRichResources($('#turns'));
-  requestAnimationFrame(() => requestAnimationFrame(() => {
-    if (preserve) scrolling.scrollTop = oldTop + (scrolling.scrollHeight - oldHeight);
-    else scrolling.scrollTop = scrolling.scrollHeight;
-  }));
+  const root = $('#turns');
+  const viewportTop = threadVisibleTop();
+  const blocks = root ? [...root.querySelectorAll(':scope > .turn-group > [data-block-key]')] : [];
+  const fineAnchors = root ? [...root.querySelectorAll(
+    ':scope > .turn-group > .turn[data-block-key] > *, ' +
+    ':scope > .turn-group > details[data-block-key] > summary, ' +
+    ':scope > .turn-group > details[data-block-key] > .processed-body > *'
+  )] : [];
+  const visibleBottom = window.innerHeight || scrolling.clientHeight;
+  const fullyVisibleAnchor = fineAnchors.find(element => {
+    const rect = element.getBoundingClientRect();
+    return rect.top >= viewportTop && rect.top < visibleBottom && rect.bottom > viewportTop;
+  });
+  const anchorElement = fullyVisibleAnchor ||
+    fineAnchors.find(element => element.getBoundingClientRect().bottom > viewportTop) || null;
+  const anchorBlock = anchorElement?.closest('[data-block-key]') ||
+    blocks.find(block => block.getBoundingClientRect().bottom > viewportTop) || null;
+  const anchor = anchorElement || anchorBlock;
+  return {
+    threadId: currentThread,
+    scrolling,
+    oldTop: scrolling.scrollTop,
+    anchorElement,
+    anchorKey: anchorBlock ? blockScrollKey(anchorBlock) : '',
+    anchorTop: anchor?.getBoundingClientRect().top,
+    wasAtBottom: threadStream.isScrollAtBottom(scrollMetrics(scrolling)),
+    userInteracting: isDirectScrollInteractionActive(),
+    interactionRevision: directScrollInteractionRevision
+  };
+}
+
+function findThreadScrollAnchor(root, key) {
+  if (!root || !key) return null;
+  return [...root.querySelectorAll(':scope > .turn-group > [data-block-key]')]
+    .find(block => blockScrollKey(block) === key) || null;
+}
+
+function restoreThreadScrollSnapshot(snapshot, follow = false) {
+  if (!snapshot || snapshot.threadId !== currentThread) return;
+  if (snapshot.interactionRevision !== directScrollInteractionRevision) return;
+  if (snapshot.userInteracting && !follow) return;
+  const { scrolling } = snapshot;
+  if (follow) {
+    scrolling.scrollTop = scrolling.scrollHeight;
+    clearNewMessages();
+    return;
+  }
+  const anchor = snapshot.anchorElement?.isConnected
+    ? snapshot.anchorElement
+    : findThreadScrollAnchor($('#turns'), snapshot.anchorKey);
+  if (anchor) {
+    scrolling.scrollTop += threadStream.scrollAnchorAdjustment(
+      snapshot.anchorTop,
+      anchor.getBoundingClientRect().top
+    );
+  } else {
+    scrolling.scrollTop = snapshot.oldTop;
+  }
+}
+
+function renderThreadHistory(mode = 'bottom') {
+  const snapshot = captureThreadScrollSnapshot();
+  const openKeys = new Set([...document.querySelectorAll('#turns details.processed[open][data-process-key]')]
+    .map(details => details.dataset.processKey));
+  const root = $('#turns');
+  root.querySelector(':scope > .empty')?.remove();
+  let older = root.querySelector(':scope > .load-older');
+  if (hasEarlierTurns && !older) {
+    older = document.createElement('button');
+    older.className = 'load-older';
+    older.type = 'button';
+    older.textContent = '加载更早消息';
+    older.addEventListener('click', loadOlder);
+    root.prepend(older);
+  } else if (!hasEarlierTurns && older) {
+    older.remove();
+    older = null;
+  }
+
+  const existing = new Map([...root.querySelectorAll(':scope > .turn-group[data-turn-key]')]
+    .map(group => [group.dataset.turnKey, group]));
+  const wanted = new Set();
+  const changedNodes = [];
+  let cursor = older ? older.nextSibling : root.firstChild;
+  currentTurns.forEach((turn, index) => {
+    const key = String(turn?.id || `turn-index-${index}`);
+    const scopedKey = `${currentThread}:${key}`;
+    const signature = JSON.stringify(turn);
+    wanted.add(key);
+    let group = existing.get(key);
+    if (!group) {
+      group = document.createElement('section');
+      group.className = 'turn-group';
+      group.dataset.turnKey = key;
+      group.setAttribute('aria-label', `任务消息 ${index + 1}`);
+    }
+    if (renderedTurnSignatures.get(scopedKey) !== signature) {
+      changedNodes.push(...reconcileTurnGroup(group, turn, index, openKeys));
+      renderedTurnSignatures.set(scopedKey, signature);
+    }
+    if (group !== cursor) root.insertBefore(group, cursor);
+    cursor = group.nextSibling;
+  });
+  for (const [key, group] of existing) {
+    if (!wanted.has(key)) {
+      renderedTurnSignatures.delete(`${currentThread}:${key}`);
+      group.querySelectorAll(':scope > [data-block-key]').forEach(block => {
+        renderedBlockSignatures.delete(`${currentThread}:${key}:${block.dataset.blockKey}`);
+      });
+      group.remove();
+    }
+  }
+  if (!currentTurns.length) root.insertAdjacentHTML('beforeend', empty('任务还没有可显示的对话'));
+  changedNodes.forEach(node => prepareRichResources(node));
+
+  const forceFollow = forceFollowNextRender;
+  forceFollowNextRender = false;
+  const follow = threadStream.shouldAutoFollow({
+    mode,
+    wasNearBottom: snapshot.wasAtBottom,
+    forceFollow,
+    userInteracting: snapshot.userInteracting
+  });
+  if (changedNodes.length && !follow && mode !== 'anchor') {
+    newMessageCount = 1;
+    updateNewMessagesButton();
+  }
+  restoreThreadScrollSnapshot(snapshot, follow);
+}
+
+function updateNewMessagesButton() {
+  const button = $('#newMessages');
+  if (!button) return;
+  button.textContent = '↓ 有新消息';
+  button.classList.toggle('hidden', newMessageCount < 1);
+}
+
+function clearNewMessages() {
+  newMessageCount = 0;
+  updateNewMessagesButton();
+}
+
+function mergeStringArrays(existing, incoming) {
+  return threadStream.mergeStringArrays(existing, incoming);
+}
+
+function mergeThreadItem(existing, incoming) {
+  return threadStream.mergeThreadItem(existing, incoming);
+}
+
+function mergeTurnItems(existing, incoming) {
+  return threadStream.mergeTurnItems(existing, incoming);
+}
+
+function mergeTurnCollections(existing, incoming) {
+  return threadStream.mergeTurnCollections(existing, incoming);
+}
+
+function prependTurnCollections(older, current) {
+  return threadStream.prependTurnCollections(older, current);
+}
+
+function reconcileThreadPageTurns(existing, incoming) {
+  return threadStream.reconcileThreadPageTurns(existing, incoming);
+}
+
+function applyLiveSnapshot(result, threadId) {
+  if (threadId !== currentThread) return;
+  liveRevision = Math.max(liveRevision, Number(result?.revision || 0));
+  const merged = mergeTurnCollections(currentTurns, result?.turns || []);
+  const signature = JSON.stringify(merged);
+  if (signature === currentThreadSignature) return;
+  const scrolling = document.scrollingElement || document.documentElement;
+  const nearBottom = threadStream.isScrollAtBottom(scrollMetrics(scrolling));
+  currentTurns = merged;
+  currentThreadSignature = signature;
+  renderThreadHistory(!currentThreadHasRendered ? 'initial' : nearBottom ? 'bottom' : 'position');
+  currentThreadHasRendered = true;
+}
+
+function stopLiveFeed() {
+  livePollController?.abort();
+  livePollController = null;
+  livePollThread = '';
+  liveFeedFailures = 0;
+  liveFullRefreshAttempts = 0;
+}
+
+function startLiveFeed(threadId) {
+  if (!threadId || (livePollThread === threadId && livePollController)) return;
+  stopLiveFeed();
+  liveRevision = 0;
+  livePollThread = threadId;
+  const controller = new AbortController();
+  livePollController = controller;
+  (async () => {
+    while (!controller.signal.aborted && currentThread === threadId) {
+      try {
+        const result = await api(
+          `/threads/${encodeURIComponent(threadId)}/live?after=${encodeURIComponent(liveRevision)}&waitMs=25000`,
+          { signal: controller.signal, suppressDiagnostic: true });
+        if (controller.signal.aborted || currentThread !== threadId) break;
+        applyLiveSnapshot(result, threadId);
+        liveFeedFailures = 0;
+        liveFullRefreshAttempts = 0;
+        if (currentThreadLoadError?.liveFeed === true) renderThreadLoadState();
+      } catch (error) {
+        if (controller.signal.aborted || currentThread !== threadId) break;
+        liveFeedFailures += 1;
+        error.liveFeed = true;
+        renderThreadLoadState(error, currentTurns.length > 0, false);
+        const reconnect = threadStream.liveReconnectPlan(liveFeedFailures, liveFullRefreshAttempts);
+        if (reconnect.forceFullRefresh) {
+          liveFullRefreshAttempts += 1;
+          await refreshCurrentThread(true, true);
+          if (!controller.signal.aborted && currentThread === threadId)
+            renderThreadLoadState(error, currentTurns.length > 0, false);
+        }
+        await new Promise(resolve => setTimeout(resolve, reconnect.delayMs));
+      }
+    }
+  })();
 }
 
 async function loadOlder() {
@@ -847,18 +1479,28 @@ async function loadOlder() {
     button.textContent = '加载中';
   }
   try {
-    const result = await api(`/threads/${encodeURIComponent(threadId)}?${pagination}&limit=${turnPageSize}`);
+    const result = await api(
+      `/threads/${encodeURIComponent(threadId)}?${pagination}&limit=${turnPageSize}`,
+      { suppressDiagnostic: true });
     if (threadId !== currentThread) return;
     const thread = result.thread || result;
-    currentTurns = [...(thread.turns || []), ...currentTurns];
+    currentTurns = prependTurnCollections(thread.turns || [], currentTurns);
     currentTurnCursor = result.nextCursor || '';
     hasEarlierTurns = Boolean(result.hasEarlier);
     currentThreadSignature = JSON.stringify(currentTurns);
-    renderThreadHistory(true);
+    renderThreadHistory('anchor');
   } catch (error) {
-    toast(error.message);
+    toast('更早的消息暂时没有加载成功');
+    if (button?.isConnected) {
+      button.disabled = false;
+      button.textContent = '重试加载更早消息';
+    }
   } finally {
     loadingOlder = false;
+    if (button?.isConnected && button.disabled) {
+      button.disabled = false;
+      button.textContent = '加载更早消息';
+    }
   }
 }
 
@@ -881,24 +1523,37 @@ function pendingRuntimeState(threadId) {
 function normalizedRuntimeState(thread) {
   const id = String(thread?.id || '');
   const live = runtimeStates[id] || null;
-  return CodexThreadStatus.normalizeThreadRuntime({
+  const normalized = CodexThreadStatus.normalizeThreadRuntime({
     thread,
     runtime: live,
     pending: pendingRuntimeState(id)
   });
+  const recovery = turnRecoveryStates[id] || null;
+  return recovery ? { ...normalized, recovery } : normalized;
 }
 
 function statusLabel(status) {
+  const recoveryStatus = status?.recovery?.status;
+  if (recoveryStatus === 'waitingToContinue' || recoveryStatus === 'startingContinuation') return '正在续接';
+  if (recoveryStatus === 'continuationRunning') return '续接运行中';
+  if (recoveryStatus === 'retryExhausted') return '续接失败';
+  if (recoveryStatus === 'ownershipUncertain') return '待确认';
   return CodexThreadStatus.statusLabel(status);
 }
 
 function statusTitle(status) {
-  const base = CodexThreadStatus.statusTitle(status);
+  const base = status?.recovery?.message || CodexThreadStatus.statusTitle(status);
   const observedAt = CodexThreadStatus.timestampMs(status?.observedAt);
   return Number.isFinite(observedAt) ? `${base}；状态记录更新于 ${new Date(observedAt).toLocaleString()}` : base;
 }
 
 function statusMeta(status, thread) {
+  if (status?.recovery?.message) {
+    const updatedAt = CodexThreadStatus.timestampMs(status.recovery.updatedAt);
+    return Number.isFinite(updatedAt)
+      ? `${status.recovery.message} · ${new Date(updatedAt).toLocaleString()}`
+      : status.recovery.message;
+  }
   const source = CodexThreadStatus.statusSourceLabel(status);
   const observedAt = CodexThreadStatus.timestampMs(status?.observedAt);
   if (Number.isFinite(observedAt)) {
@@ -913,21 +1568,156 @@ function threadCard(thread) {
   const title = thread.name || thread.preview || '未命名任务';
   const cwd = thread.cwd || '';
   const runtime = normalizedRuntimeState(thread);
-  return `<article class="card task-card" onclick="openThread('${esc(thread.id)}')">
+  return `<article class="card task-card" onclick="openTask('${esc(thread.id)}')">
     <div class="cardTop"><div><h3 title="${esc(title)}">${esc(title)}</h3><p title="${esc(cwd)}">${esc(cwd)}</p></div>
     <span class="badge" title="${esc(statusTitle(runtime))}">${esc(statusLabel(runtime))}</span></div><p class="task-time" title="${esc(statusTitle(runtime))}">${esc(statusMeta(runtime, thread))}</p></article>`;
 }
 
 function projectCard(project) {
-  return `<article class="card project-card"><div class="cardTop"><div><h3>${esc(project.name)}</h3><p>${esc(project.path)}</p></div>
-    <span class="badge">${esc(project.kind)}</span></div><div class="actions">
-    <button onclick='event.stopPropagation();startThread(${JSON.stringify(project.path)})'>在此项目新建任务</button></div></article>`;
+  return `<button type="button" class="project-choice" data-project-path="${esc(project.path)}"><b>${esc(project.name)}</b><small>${esc(project.path)}</small></button>`;
 }
 
 function processCard(process) {
   return `<article class="card process-card"><div><h3>${esc(process.name)} <small>PID ${process.pid}</small></h3>
     <p>${process.memoryMb} MB · ${when(process.startedAt)}</p></div>
     <button class="danger" onclick="stopProcess(${process.pid})">停止</button></article>`;
+}
+
+function auditProcessName(process, fallback = '未知程序') {
+  if (!process || typeof process !== 'object') return fallback;
+  return String(process.name || process.processName || process.executable || process.path || fallback);
+}
+
+function auditProcessPath(process) {
+  if (!process || typeof process !== 'object') return '';
+  return String(process.path || process.executablePath || process.imagePath || '');
+}
+
+function redactedAuditCommand(process) {
+  if (!process || typeof process !== 'object') return '';
+  const provided = process.redactedCommand || process.redactedCommandLine || process.sanitizedCommand || process.sanitizedCommandLine;
+  const raw = String(provided || process.commandLine || process.command || '');
+  if (!raw) return '';
+  return raw
+    .replace(/(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s"']+/gi, '$1[已隐藏]')
+    .replace(/((?:token|api[-_]?key|password|passwd|secret)\s*[:=]\s*)[^\s"']+/gi, '$1[已隐藏]')
+    .replace(/(ghp_|github_pat_|sk-)[A-Za-z0-9_-]+/g, '$1[已隐藏]');
+}
+
+function auditChainItem(item) {
+  if (typeof item === 'string') return item;
+  if (!item || typeof item !== 'object') return '未知程序';
+  const pid = Number(item.pid || item.processId);
+  return `${auditProcessName(item)}${Number.isFinite(pid) && pid > 0 ? ` (PID ${pid})` : ''}`;
+}
+
+function auditInterval(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value <= 0) return '尚未形成周期';
+  if (value < 60) return `约 ${value < 10 ? value.toFixed(1) : Math.round(value)} 秒一次`;
+  return `约 ${(value / 60).toFixed(value < 600 ? 1 : 0)} 分钟一次`;
+}
+
+function consoleLaunchCard(event) {
+  const source = event?.sourceProcess || {};
+  const commandProcess = event?.commandProcess || {};
+  const windowProcess = event?.windowProcess || {};
+  const pid = Number(source.pid || source.processId);
+  const sourcePath = auditProcessPath(source);
+  const commandPath = String(event?.executablePath || auditProcessPath(commandProcess) || '');
+  const command = redactedAuditCommand({ commandLine: event?.commandLine || commandProcess?.commandLine || '' });
+  const chain = Array.isArray(event?.chain) ? event.chain : [];
+  const classification = String(event?.classification || '待判断');
+  const count = Math.max(1, Number(event?.count) || 1);
+  const lastSeen = event?.lastSeenAt ? when(event.lastSeenAt) : '刚刚';
+  return `<article class="console-launch-card">
+    <div class="console-launch-heading"><div><h4>${esc(auditProcessName(source))}</h4><small>${esc(lastSeen)}</small></div><span class="badge">${esc(classification)}</span></div>
+    <p class="console-launch-explanation">${esc(event?.explanation || `${auditProcessName(source)} 启动了 ${auditProcessName(windowProcess, '终端窗口')}`)}</p>
+    <div class="console-launch-stats"><span><b>${count}</b> 次</span><span>${esc(auditInterval(event?.averageIntervalSeconds))}</span></div>
+    <details class="console-launch-details"><summary>查看来源链、路径和命令</summary>
+      <dl>
+        <div><dt>弹窗进程</dt><dd>${esc(auditChainItem(windowProcess))}</dd></div>
+        <div><dt>来源程序</dt><dd>${esc(auditChainItem(source))}</dd></div>
+        <div><dt>来源路径</dt><dd class="audit-code">${esc(sourcePath || '未能获取')}</dd></div>
+        <div><dt>命令进程</dt><dd>${esc(auditChainItem(commandProcess))}</dd></div>
+        <div><dt>命令路径</dt><dd class="audit-code">${esc(commandPath || '未能获取')}</dd></div>
+        <div><dt>脱敏命令</dt><dd class="audit-code">${esc(command || '未能获取')}</dd></div>
+      </dl>
+      <div class="audit-chain"><b>启动链</b><ol>${(chain.length ? chain : [source, windowProcess]).map(item => `<li>${esc(auditChainItem(item))}</li>`).join('')}</ol></div>
+      ${Number.isFinite(pid) && pid > 0 ? `<button type="button" class="danger" onclick="stopProcess(${pid})">停止来源进程 PID ${pid}</button>` : ''}
+    </details>
+  </article>`;
+}
+
+function renderConsoleAudit() {
+  const supported = consoleAuditState.supported !== false;
+  const events = Array.isArray(consoleAuditState.events) ? consoleAuditState.events : [];
+  const capturing = consoleAuditState.capturing === true;
+  $('#consoleAuditBadge').textContent = !supported ? '此电脑不支持' : capturing ? '正在记录' : '已暂停';
+  $('#consoleAuditBadge').classList.toggle('attention', supported && !capturing);
+  $('#consoleAuditDescription').textContent = !supported
+    ? '当前电脑端版本不支持终端弹窗追踪，请先更新电脑端。'
+    : capturing
+      ? '正在记录短暂出现的 CMD、PowerShell 和终端窗口。记录只会在你打开本页或点刷新时读取。'
+      : '记录已暂停，现有来源信息会保留。';
+  $('#toggleConsoleAudit').disabled = consoleAuditLoading || !supported;
+  $('#toggleConsoleAudit').textContent = capturing ? '暂停记录' : '继续记录';
+  $('#clearConsoleAudit').disabled = consoleAuditLoading || !supported || events.length === 0;
+  $('#reloadConsoleAudit').disabled = consoleAuditLoading;
+  $('#consoleLaunchList').innerHTML = consoleAuditLoading && events.length === 0
+    ? empty('正在读取弹窗来源')
+    : events.map(consoleLaunchCard).join('') || empty(capturing ? '尚未捕获到终端弹窗' : '没有已保存的弹窗记录');
+}
+
+async function loadConsoleLaunches() {
+  if (consoleAuditLoading) return;
+  consoleAuditLoading = true;
+  renderConsoleAudit();
+  try {
+    const result = await api('/diagnostics/console-launches');
+    consoleAuditState = {
+      supported: result?.supported !== false,
+      capturing: result?.capturing === true,
+      events: Array.isArray(result?.events) ? result.events : []
+    };
+  } catch (error) {
+    if (error.status === 404) consoleAuditState = { supported: false, capturing: false, events: [] };
+    else if (authenticated) toast(`弹窗来源读取失败：${error.message}`);
+  } finally {
+    consoleAuditLoading = false;
+    renderConsoleAudit();
+  }
+}
+
+async function setConsoleAuditCapturing(enabled) {
+  if (consoleAuditLoading || consoleAuditState.supported === false) return;
+  consoleAuditLoading = true;
+  renderConsoleAudit();
+  try {
+    await api('/diagnostics/console-audit/capture', { method: 'POST', body: { enabled } });
+    toast(enabled ? '弹窗来源记录已继续' : '弹窗来源记录已暂停');
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    consoleAuditLoading = false;
+    await loadConsoleLaunches();
+  }
+}
+
+async function clearConsoleAudit() {
+  if (!confirm('确定清空全部终端弹窗来源记录吗？此操作无法撤销。')) return;
+  consoleAuditLoading = true;
+  renderConsoleAudit();
+  try {
+    await api('/diagnostics/console-audit/clear', { method: 'POST', body: { confirmation: 'CLEAR AUDIT' } });
+    consoleAuditState.events = [];
+    toast('弹窗来源记录已清空');
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    consoleAuditLoading = false;
+    await loadConsoleLaunches();
+  }
 }
 
 function isUserInputRequest(request) {
@@ -1571,12 +2361,11 @@ function renderDetailPending() {
 }
 
 function renderPendingLists() {
-  const recent = $('#recentApprovals');
   const all = $('#approvalList');
-  recent.innerHTML = pendingRequests.map((request, index) => approvalCard(request, `recent-${index}`)).join('') || empty('暂无待处理事项');
   all.innerHTML = pendingRequests.map((request, index) => approvalCard(request, `all-${index}`)).join('') || empty('暂无待处理事项');
-  prepareLocalResources(recent).catch(() => { /* The link can be retried by tapping it. */ });
   prepareLocalResources(all).catch(() => { /* The link can be retried by tapping it. */ });
+  $('#taskAttention').classList.toggle('hidden', pendingRequests.length === 0);
+  $('#taskAttention').textContent = `有 ${pendingRequests.length} 项需要你处理 →`;
   renderDetailPending();
   renderApprovalControls();
   updatePendingCountdowns();
@@ -1619,8 +2408,7 @@ function renderApprovalControls() {
         ? '已开启：电脑端桥接服务会自动允许 Console 管理的新审批。需要回答的问题和表单仍会停下来。'
         : '开启后，电脑端桥接服务会对 Console 管理的新审批自动选择允许。需要你回答的问题仍会停下来。';
   }
-  $('#autoApproveBanner')?.classList.toggle('hidden', !enabled);
-  document.body.classList.toggle('auto-approval-enabled', enabled);
+  $('#settingsApprovalStatus').textContent = !supported ? '审批设置暂不可用' : enabled ? '自动允许已开启 · 需要回答的问题仍会通知你' : '自动允许已关闭 · 按每次任务设置运行';
   updatePermissionHint();
 }
 
@@ -1647,6 +2435,8 @@ async function load() {
       $('#machine').textContent = summary.machine;
       $('#state').textContent = summary.codexReady ? 'Codex 已连接 · 局域网模式' : '桥接在线，Codex 正在启动';
       $('#dot').classList.toggle('online', summary.codexReady);
+      renderAdministratorMode(summary.administratorMode);
+      renderBrowserStatus(summary.browser);
       const threads = summary.threads?.data || summary.threads?.threads || [];
       runtimeStates = CodexThreadStatus.mergeRuntimeStates(
         runtimeStates,
@@ -1654,14 +2444,13 @@ async function load() {
         lastThreadRefreshAt,
         summaryStartedAt
       );
+      turnRecoveryStates = Object.fromEntries((summary.turnRecovery || [])
+        .filter(item => item?.threadId)
+        .map(item => [String(item.threadId), item]));
       const nextPending = summary.pending || [];
       const nextSignature = nextPending.map(request => `${request.key}:${request.createdAt}`).join('|');
       pendingRequests = nextPending;
       const projects = mergedProjects(summary.projects, threads);
-      $('#threadCount').textContent = threads.length;
-      $('#projectCount').textContent = projects.length;
-      $('#processCount').textContent = summary.processes.length;
-      $('#recentThreads').innerHTML = threads.slice(0, 5).map(threadCard).join('') || empty('暂无任务');
       $('#threadList').innerHTML = threads.map(threadCard).join('') || empty('暂无任务');
       $('#projectList').innerHTML = projects.map(projectCard).join('') || empty('没有发现项目');
       $('#processList').innerHTML = summary.processes.map(processCard).join('') || empty('没有相关进程');
@@ -1685,6 +2474,52 @@ async function load() {
   } finally {
     if (summaryLoadPromise === request) summaryLoadPromise = null;
   }
+}
+
+function renderAdministratorMode(value) {
+  const view = CodexAdministratorMode.presentation(value);
+  administratorMode = view;
+  const card = $('#administratorModeCard');
+  if (!card) return;
+  card.classList.toggle('active', view.active);
+  card.classList.toggle('inactive', view.detected && !view.active);
+  card.classList.toggle('unknown', !view.detected);
+  $('#administratorModeBadge').textContent = view.badge;
+  $('#administratorModeDescription').textContent = view.detail;
+  updatePermissionHint();
+}
+
+function renderBrowserStatus(value) {
+  browserStatus = { ...browserStatus, ...(value || {}) };
+  const state = browserStatus.running ? 'ready' : browserStatus.starting ? 'starting' : browserStatus.state || 'checking';
+  const labels = {
+    ready: 'Chrome 已就绪',
+    starting: '正在启动',
+    missing: '未找到 Chrome',
+    error: '启动失败',
+    checking: '检查中',
+    idle: '等待使用'
+  };
+  const badge = $('#browserBadge');
+  if (badge) {
+    badge.textContent = labels[state] || '等待使用';
+    badge.className = `browser-badge ${state}`;
+  }
+  if ($('#browserDescription')) $('#browserDescription').textContent = browserStatus.message || (
+    browserStatus.running
+      ? 'Chrome 已在电脑上运行；浏览器任务可以直接使用现有登录状态。'
+      : '需要时会自动在电脑上启动 Chrome。');
+  if ($('#browserAutoStart')) {
+    $('#browserAutoStart').checked = browserStatus.autoStartWithBridge !== false;
+    $('#browserAutoStart').disabled = browserBusy;
+  }
+  if ($('#startBrowser')) {
+    $('#startBrowser').disabled = browserBusy || browserStatus.starting || browserStatus.installed === false;
+    $('#startBrowser').textContent = browserBusy || browserStatus.starting
+      ? '正在启动…'
+      : browserStatus.running ? 'Chrome 已运行' : '启动 Chrome';
+  }
+  if ($('#openRemoteWork')) $('#openRemoteWork').disabled = remoteWorkBusy || browserStatus.installed === false;
 }
 
 function activePage() {
@@ -1713,14 +2548,22 @@ function navigationState(page, threadId = '', depth = navigationDepth) {
 function renderPage(id) {
   const previousDetail = $('#threadDetail').classList.contains('active');
   if (previousDetail && id !== 'threadDetail') saveDraft();
+  if (id !== 'threadDetail') stopLiveFeed();
   document.querySelectorAll('.page').forEach(page => page.classList.toggle('active', page.id === id));
-  document.querySelectorAll('nav button').forEach(button => button.classList.toggle('active', button.dataset.page === id));
+  const tab = ['processes', 'approvals'].includes(id) ? 'settings' : id === 'threadDetail' ? 'threads' : id;
+  document.querySelectorAll('.app-nav [data-page]').forEach(button => {
+    const selected = button.dataset.page === tab;
+    button.classList.toggle('active', selected);
+    if (selected) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  });
   document.body.classList.toggle('detail-open', id === 'threadDetail');
   const scrolling = document.scrollingElement || document.documentElement;
   scrolling.scrollTop = 0;
   document.documentElement.scrollTop = 0;
   document.body.scrollTop = 0;
   scrollTo({ top: 0, left: 0, behavior: 'auto' });
+  if (id === 'processes' && authenticated) loadConsoleLaunches();
 }
 
 function commitNavigation(page, threadId = '', mode = 'push', depth = null) {
@@ -1735,8 +2578,9 @@ function commitNavigation(page, threadId = '', mode = 'push', depth = null) {
   }
   const nextDepth = depth ?? (mode === 'replace' ? current?.depth ?? navigationDepth : (current?.depth ?? navigationDepth) + 1);
   const next = navigationState(page, threadId, nextDepth);
-  if (mode === 'replace') history.replaceState(next, '', location.href);
-  else history.pushState(next, '', location.href);
+  const url = navigationUrl(page, threadId);
+  if (mode === 'replace') history.replaceState(next, '', url);
+  else history.pushState(next, '', url);
   navigationDepth = next.depth;
   return next;
 }
@@ -1747,7 +2591,18 @@ function showPage(id, options = {}) {
   renderPage(page);
 }
 
+function navigationUrl(page, threadId = '') {
+  const url = new URL('/', location.href);
+  url.searchParams.set('page', page);
+  if (page === 'threadDetail' && threadId) url.searchParams.set('threadId', threadId);
+  return url.pathname + url.search;
+}
+
 function closeTransientLayer() {
+  if ($('#newTaskDialog').open) {
+    $('#newTaskDialog').close();
+    return true;
+  }
   if (!$('#commandPanel').classList.contains('hidden')) {
     closeCommandPanel(false);
     return true;
@@ -1784,14 +2639,14 @@ function handleBackNavigation() {
   }
   if (page === 'threadDetail') {
     const threads = navigationState('threads', '', 0);
-    history.replaceState(threads, '', location.href);
+    history.replaceState(threads, '', navigationUrl('threads'));
     navigationDepth = 0;
     renderPage('threads');
     return true;
   }
   if (page !== rootPage) {
     const root = navigationState(rootPage, '', 0);
-    history.replaceState(root, '', location.href);
+    history.replaceState(root, '', navigationUrl(rootPage));
     navigationDepth = 0;
     renderPage(rootPage);
     return true;
@@ -1806,7 +2661,7 @@ async function restoreNavigation(value, loadThread = true) {
   navigationDepth = state.depth;
   if (state.page === 'threadDetail') {
     renderPage('threadDetail');
-    if (loadThread) await openThread(state.threadId, false, 'none');
+    if (loadThread) await openTask(state.threadId, false, 'none');
     else currentThread = state.threadId;
     return;
   }
@@ -1816,8 +2671,12 @@ async function restoreNavigation(value, loadThread = true) {
 function initializeNavigation() {
   let state = normalizedNavigationState();
   if (!state) {
-    state = navigationState(rootPage, '', 0);
-    history.replaceState(state, '', location.href);
+    const params = new URLSearchParams(location.search);
+    const requestedPage = params.get('page');
+    const requestedThread = params.get('threadId') || '';
+    const page = requestedPage === 'threadDetail' && requestedThread ? requestedPage : primaryPages.has(requestedPage) ? requestedPage : rootPage;
+    state = navigationState(page, requestedThread, 0);
+    history.replaceState(state, '', navigationUrl(state.page, state.threadId));
   }
   navigationDepth = state.depth;
   if (state.page === 'threadDetail') {
@@ -1833,9 +2692,36 @@ window.addEventListener('popstate', event => {
   restoreNavigation(state, true).catch(error => toast(error.message));
 });
 
-document.querySelectorAll('nav button').forEach(button => {
+document.querySelectorAll('.app-nav button').forEach(button => {
   button.onclick = () => showPage(button.dataset.page);
 });
+document.querySelectorAll('[data-settings-page]').forEach(button => {
+  button.onclick = () => showPage(button.dataset.settingsPage);
+});
+
+$('#newMessages').addEventListener('click', () => {
+  const scrolling = document.scrollingElement || document.documentElement;
+  scrolling.scrollTo({ top: scrolling.scrollHeight, behavior: 'smooth' });
+  clearNewMessages();
+});
+
+function markDirectScrollInteraction(durationMs = 700) {
+  directScrollInteractionRevision += 1;
+  directScrollInteractionUntil = Math.max(directScrollInteractionUntil, Date.now() + durationMs);
+}
+
+document.addEventListener('touchstart', () => markDirectScrollInteraction(900), { passive: true });
+document.addEventListener('touchmove', () => markDirectScrollInteraction(900), { passive: true });
+document.addEventListener('wheel', () => markDirectScrollInteraction(500), { passive: true });
+document.addEventListener('pointerdown', event => {
+  if (event.pointerType !== 'touch') markDirectScrollInteraction(500);
+}, { passive: true });
+
+document.addEventListener('scroll', () => {
+  if (newMessageCount < 1) return;
+  const scrolling = document.scrollingElement || document.documentElement;
+  if (threadStream.isScrollAtBottom(scrollMetrics(scrolling))) clearNewMessages();
+}, { passive: true });
 
 $('#pairForm').onsubmit = async event => {
   event.preventDefault();
@@ -1854,7 +2740,7 @@ $('#pairForm').onsubmit = async event => {
     authenticated = true;
     localStorage.removeItem(tokenKey);
     if (nativeConfigured) token = '';
-    await Promise.all([load(), loadApprovalSettings()]);
+    await Promise.all([load(), loadApprovalSettings(), loadModelCatalog()]);
     await restoreNavigation(history.state, true);
   } catch (error) {
     $('#pairError').textContent = error.message;
@@ -1866,21 +2752,61 @@ function updateComposerState() {
   const unknown = currentRuntimeState?.isRunning !== true && currentRuntimeState?.isRunning !== false;
   const controllable = currentRuntimeState?.canControl !== false;
   const phase = currentRuntimeState?.phase || '';
+  const recovery = currentRuntimeState?.recovery || null;
+  const recoveryIsActive = ['running', 'waitingToContinue', 'startingContinuation', 'continuationRunning']
+    .includes(String(recovery?.status || ''));
+  const receipt = lastDeliveryReceipt?.threadId === currentThread &&
+    (lastDeliveryReceipt.pending === true || Date.now() - Number(lastDeliveryReceipt.createdAt || 0) < 2 * 60 * 1000)
+    ? lastDeliveryReceipt
+    : null;
   $('#interruptTurn').classList.toggle('hidden', !currentActiveTurnId || !controllable);
-  $('#sendMode').textContent = unknown
+  $('#sendMode').textContent = receipt?.message
+    ? receipt.message
+    : recoveryIsActive && recovery?.message
+    ? recovery.message
+    : unknown
     ? '当前状态不可见；发送时会由电脑端重新确认'
     : !running
       ? '发送新的指令'
       : !controllable
-        ? '当前轮次正在运行；结束后即可续接'
+        ? '当前轮次由电脑端运行；新指令会安全排队'
         : phase === 'waitingInput'
           ? '任务正在等待你的回答'
           : phase === 'waitingApproval'
             ? '任务正在等待批准'
-            : '当前任务运行中，将作为补充指令发送';
+            : '当前任务运行中；发送会插入并可能改变正在执行的步骤';
   $('#sendMode').title = statusTitle(currentRuntimeState);
-  if (!sending) $('#sendMessage').textContent = running && controllable ? '追加' : '发送';
+  $('#commandFailure').classList.toggle('hidden', !receipt?.error);
+  $('#commandFailureText').textContent = receipt?.error ? `${receipt.error}\n诊断编号：${receipt.id}` : '';
+  $('#sendMode').classList.toggle('queued', Boolean(receipt?.pending));
+  $('#sendMode').classList.toggle('failed', /failed|cancelled|canceled/.test(String(receipt?.status || '')));
+  if (!sending) $('#sendMessage').textContent = running && controllable
+    ? '插入当前轮次'
+    : running && !controllable ? '排队发送' : '发送';
   updatePermissionHint();
+}
+
+function synchronizeCommandReceipt(result, threadId) {
+  const receipts = Array.isArray(result?.commandOutbox) ? result.commandOutbox : [];
+  if (!receipts.length) return;
+  const currentId = lastDeliveryReceipt?.threadId === threadId ? String(lastDeliveryReceipt.id || '') : '';
+  let receipt = currentId ? receipts.find(item => String(item?.id || '') === currentId) : null;
+  if (!receipt) {
+    receipt = [...receipts].sort((left, right) =>
+      Date.parse(right?.updatedAt || right?.createdAt || '') - Date.parse(left?.updatedAt || left?.createdAt || '')
+    ).find(item => {
+      const status = String(item?.status || '').toLowerCase();
+      const updatedAt = Date.parse(item?.updatedAt || item?.createdAt || '');
+      return !/delivered|failed|cancelled|canceled/.test(status) || updatedAt > Date.now() - 2 * 60 * 1000;
+    });
+  }
+  if (!receipt) return;
+  const presentation = threadStream.deliveryReceiptPresentation({ receipt }, false);
+  lastDeliveryReceipt = {
+    ...presentation,
+    threadId,
+    createdAt: Date.parse(receipt.updatedAt || receipt.createdAt || '') || Date.now()
+  };
 }
 
 const quickCommands = [
@@ -1888,6 +2814,7 @@ const quickCommands = [
   { id: 'goal', alias: '/goal', title: '设置工作目标', description: '让 Codex 建立并持续追踪一个明确目标', intent: 'plain', seed: '请将下面的内容设置为当前工作目标，并持续推进直到完成：\n' },
   { id: 'skills', alias: '/skills', title: '选择技能', description: '从电脑已经安装的技能中选择，不用输入名称', action: 'skills' },
   { id: 'tools', alias: '/tools', title: '选择工具', description: '选择浏览器、桌面、联网或文件能力', action: 'tools' },
+  { id: 'remote-work', alias: '/remote', title: '远程办事', description: '用电脑 Chrome 的登录状态处理网页事务', action: 'remote-work' },
   { id: 'compact', alias: '/compact', title: '压缩当前上下文', description: '让 Codex 正式压缩冗长历史，保留关键进度', action: 'compact', intent: 'plain', seed: '请整理当前任务上下文，只保留工作目标、已完成内容、重要决定、未解决问题和下一步，然后继续处理。' },
   { id: 'status', alias: '/status', title: '查看任务状态', description: '汇报完成情况、阻碍和下一步', intent: 'explain', seed: '请简要汇报当前任务状态：已经完成什么、正在处理什么、是否存在阻碍，以及下一步是什么。' },
   { id: 'stop', alias: '/stop', title: '停止当前任务', description: '中断正在运行的这一轮', action: 'stop' },
@@ -2174,6 +3101,11 @@ function applyQuickCommand(id) {
     $('#newThread').click();
     return;
   }
+  if (command.action === 'remote-work') {
+    closeCommandPanel(false);
+    openRemoteWorkPanel();
+    return;
+  }
   if (command.action === 'compact') {
     compactCurrentThread(command);
     return;
@@ -2207,6 +3139,7 @@ function toggleSkill(path) {
 
 const executionSettingsKey = 'codexExecutionSettingsV2';
 const legacyExecutionSettingsKey = 'codexExecutionSettings';
+const modelSettingsKey = 'codexModelSettingsV1';
 const defaultExecutionSettings = Object.freeze({ permissions: ':danger-full-access', approvalMode: 'never' });
 const dangerAcknowledgedKey = 'codexDangerPermissionAcknowledgedV2';
 const unrestrictedAcknowledgedKey = 'codexUnrestrictedAutonomyAcknowledgedV1';
@@ -2260,6 +3193,113 @@ function saveExecutionSettings() {
   updatePermissionHint();
 }
 
+function currentModelSettings() {
+  return modelSettings.normalize({
+    model: $('#modelChoice').value,
+    reasoningEffort: $('#reasoningEffort').value
+  });
+}
+
+const reasoningEffortLabels = Object.freeze({
+  minimal: '最少', low: '轻量', medium: '标准', high: '深入', xhigh: '更深入', max: '最高', ultra: '极限'
+});
+
+function addSelectOption(select, value, label, title = '') {
+  const option = document.createElement('option');
+  option.value = value;
+  option.textContent = label;
+  if (title) option.title = title;
+  select.append(option);
+}
+
+function renderReasoningEfforts(preferredEffort = '') {
+  const select = $('#reasoningEffort');
+  const selectedModel = $('#modelChoice').value;
+  select.replaceChildren();
+  if (!selectedModel) {
+    addSelectOption(select, '', '跟随任务设置');
+    select.value = '';
+    select.disabled = true;
+    select.title = '选择具体模型后才可设置思考深度';
+    return;
+  }
+
+  const efforts = modelSettings.availableEfforts(availableModelCatalog, selectedModel);
+  if (!efforts.length) {
+    addSelectOption(select, '', '由模型决定');
+    select.value = '';
+    select.disabled = true;
+    select.title = '这个模型没有提供可选的思考深度';
+    return;
+  }
+
+  addSelectOption(select, '', '自动选择');
+  for (const option of efforts) {
+    addSelectOption(
+      select,
+      option.effort,
+      reasoningEffortLabels[option.effort] || option.effort,
+      option.description || ''
+    );
+  }
+  select.disabled = false;
+  select.value = efforts.some(option => option.effort === preferredEffort) ? preferredEffort : '';
+  select.title = '只显示当前模型支持的思考深度';
+}
+
+function renderModelCatalog(catalog, preference, fallback = false) {
+  availableModelCatalog = catalog;
+  const select = $('#modelChoice');
+  const reconciled = modelSettings.reconcileSelection(preference, catalog);
+  select.replaceChildren();
+  addSelectOption(select, '', '沿用任务设置');
+  for (const item of catalog) {
+    addSelectOption(
+      select,
+      item.model,
+      `${item.displayName}${item.isDefault ? '（默认）' : ''}`,
+      item.description || item.model
+    );
+  }
+  select.value = reconciled.model;
+  select.title = fallback
+    ? '电脑端模型目录暂时不可用，当前显示兼容选项'
+    : '模型列表来自这台电脑上的 Codex';
+  renderReasoningEfforts(reconciled.reasoningEffort);
+  return reconciled;
+}
+
+function loadModelSettings() {
+  const stored = modelSettings.parsePreference(localStorage.getItem(modelSettingsKey));
+  renderModelCatalog(modelSettings.fallbackCatalog(), stored, true);
+}
+
+async function loadModelCatalog() {
+  const stored = modelSettings.parsePreference(localStorage.getItem(modelSettingsKey));
+  try {
+    const response = await api('/models', { suppressDiagnostic: true, timeoutMs: 8000 });
+    const catalog = modelSettings.normalizeCatalog(response);
+    if (!catalog.length) throw new Error('电脑端没有返回可选模型');
+    const reconciled = renderModelCatalog(catalog, stored, false);
+    localStorage.setItem(modelSettingsKey, JSON.stringify(reconciled));
+  } catch {
+    // The static choices keep the composer usable while an older or restarting
+    // Bridge cannot provide model/list. Preserve unsupported stored choices so
+    // a later successful catalog refresh can restore them.
+    renderModelCatalog(modelSettings.fallbackCatalog(), stored, true);
+  }
+}
+
+function saveModelSettings() {
+  localStorage.setItem(modelSettingsKey, JSON.stringify(currentModelSettings()));
+}
+
+function handleModelChoiceChange() {
+  const previousEffort = $('#reasoningEffort').value;
+  renderReasoningEfforts(previousEffort);
+  saveModelSettings();
+}
+
 function activeExecutionPreset() {
   const permission = $('#runtimePermission').value;
   const mode = $('#approvalMode').value;
@@ -2306,6 +3346,13 @@ function updatePermissionHint() {
   const ownership = permission === ':danger-full-access' && mode === 'never'
     ? ' 由其他 Codex 进程已经发起的活动轮次会保留原有设置；手机续跑时会使用这里的权限。'
     : '';
+  const elevation = permission === ':danger-full-access'
+    ? administratorMode.active
+      ? ' 管理员模式已启用；仅 Bridge 新建或手机发起的新轮次继承。'
+      : administratorMode.detected
+        ? ' 管理员模式未启用；Windows UAC 仍可能在电脑上要求确认。'
+        : ' 管理员模式状态未知。'
+    : '';
   let text = permission === ':read-only'
     ? '只读沙箱：Codex 可以查看内容，但不能修改文件。'
     : permission === ':danger-full-access'
@@ -2326,7 +3373,7 @@ function updatePermissionHint() {
   if (mode === 'strict') text += approvalAutomation.autoApproveAll
     ? ' 自动批准已覆盖严格询问，审批会直接选择 Yes。'
     : ' 大多数外部操作都会要求确认。';
-  hint.textContent = text + ownership + nextTurn;
+  hint.textContent = text + elevation + ownership + nextTurn;
   hint.classList.toggle('warning', permission === ':danger-full-access' || approvalAutomation.autoApproveAll);
   updateExecutionPresetState();
 }
@@ -2525,22 +3572,85 @@ function messageId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-async function refreshCurrentThread(background = false) {
-  if (!currentThread) return;
-  if (background && (document.visibilityState !== 'visible' || !$('#threadDetail').classList.contains('active'))) return;
-  const threadId = currentThread;
-  const scrolling = document.scrollingElement || document.documentElement;
-  const nearBottom = scrolling.scrollHeight - scrolling.scrollTop - scrolling.clientHeight < 180;
-  let request = latestThreadRequests.get(threadId);
-  if (!request) {
-    request = api(`/threads/${encodeURIComponent(threadId)}?paged=true&limit=${turnPageSize}`);
-    latestThreadRequests.set(threadId, request);
-    request.finally(() => {
-      if (latestThreadRequests.get(threadId) === request) latestThreadRequests.delete(threadId);
-    }).catch(() => { /* The original await reports the request error. */ });
+function retryableThreadError(error) {
+  return CodexThreadResilience.retryableThreadError(error);
+}
+
+function threadRetryDelay(failures) {
+  return CodexThreadResilience.retryDelay(failures);
+}
+
+function recordThreadFailure(threadId, error) {
+  const previous = threadRetryStates.get(threadId);
+  const failures = (previous?.failures || 0) + 1;
+  const nextRetryAt = Date.now() + threadRetryDelay(failures);
+  threadRetryStates.set(threadId, { failures, nextRetryAt, error });
+  return nextRetryAt;
+}
+
+function clearThreadFailure(threadId) {
+  threadRetryStates.delete(threadId);
+}
+
+function cacheThreadPage(threadId, result) {
+  threadPageCache.delete(threadId);
+  threadPageCache.set(threadId, { result, savedAt: Date.now() });
+  while (threadPageCache.size > threadPageCacheLimit) {
+    const oldest = threadPageCache.keys().next().value;
+    if (!oldest) break;
+    threadPageCache.delete(oldest);
   }
-  const result = await request;
-  if (threadId !== currentThread) return;
+}
+
+function cachedThreadPage(threadId) {
+  const cached = threadPageCache.get(threadId);
+  if (!cached) return null;
+  threadPageCache.delete(threadId);
+  threadPageCache.set(threadId, cached);
+  return cached;
+}
+
+function renderThreadLoadState(error = null, cached = false, checking = false) {
+  const root = $('#threadLoadState');
+  if (!root) return;
+  currentThreadLoadError = error;
+  if (!error && !checking) {
+    root.classList.add('hidden');
+    return;
+  }
+  const title = $('#threadLoadTitle');
+  const meta = $('#threadLoadMeta');
+  const details = $('#threadLoadDetails');
+  const retry = $('#threadLoadRetry');
+  if (checking) {
+    title.textContent = '正在检查最新内容';
+    meta.textContent = cached ? '下面先显示上次成功读取的内容。' : '通常只需要几秒钟。';
+    details.classList.add('hidden');
+    retry.classList.add('hidden');
+  } else {
+    title.textContent = error?.liveFeed
+      ? '实时连接中断，正在重新连接'
+      : cached ? '最新内容暂时无法读取' : '任务内容暂时无法读取';
+    const kind = String(error?.kind || (error?.status ? 'httpError' : 'networkError'));
+    const requestId = String(error?.requestId || '').trim();
+    const runNotice = currentRuntimeState?.isRunning === true
+      ? '电脑端任务仍在运行。'
+      : currentRuntimeState?.isRunning === false
+        ? ''
+        : '详情读取失败不代表任务停止，它可能仍在电脑端运行。';
+    meta.textContent = error?.liveFeed
+      ? `已有消息会保留；系统正在重新读取完整任务页。${requestId ? ` 请求编号 ${requestId}` : ''}`
+      : cached
+      ? `已保留上次内容。${runNotice}系统会自动重试。${requestId ? ` 请求编号 ${requestId}` : ` 错误类型 ${kind}`}`
+      : `${runNotice}系统会自动重试。${requestId ? `请求编号 ${requestId}` : `错误类型 ${kind}`}`;
+    details.classList.remove('hidden');
+    retry.classList.remove('hidden');
+  }
+  root.classList.remove('hidden');
+}
+
+function applyThreadPage(result, threadId, background = false) {
+  if (threadId !== currentThread) return false;
   lastThreadRefreshAt.set(threadId, Date.now());
   const thread = result.thread || result;
   if (thread.cwd && thread.cwd !== currentThreadCwd) {
@@ -2550,7 +3660,7 @@ async function refreshCurrentThread(background = false) {
     loadPermissionProfiles(thread.cwd).catch(error => toast(error.message));
   }
   $('#detailTitle').textContent = thread.name || thread.preview || '任务';
-  const nextTurns = thread.turns || [];
+  const nextTurns = reconcileThreadPageTurns(currentTurns, thread.turns || []);
   const nextSignature = JSON.stringify(nextTurns);
   currentTurns = nextTurns;
   currentTurnCursor = result.nextCursor || '';
@@ -2559,30 +3669,100 @@ async function refreshCurrentThread(background = false) {
     if (result.runtimeState) runtimeStates[threadId] = result.runtimeState;
     else delete runtimeStates[threadId];
   }
+  if (Object.prototype.hasOwnProperty.call(result, 'turnRecovery')) {
+    if (result.turnRecovery) turnRecoveryStates[threadId] = result.turnRecovery;
+    else delete turnRecoveryStates[threadId];
+  }
+  synchronizeCommandReceipt(result, threadId);
   currentRuntimeState = normalizedRuntimeState(thread);
   currentActiveTurnId = currentRuntimeState?.canControl && currentRuntimeState?.isRunning
     ? (currentRuntimeState.activeTurnId || '')
     : '';
   updateComposerState();
   if (!background || nextSignature !== currentThreadSignature) {
+    const scrolling = document.scrollingElement || document.documentElement;
+    const nearBottom = threadStream.isScrollAtBottom(scrollMetrics(scrolling));
     currentThreadSignature = nextSignature;
-    renderThreadHistory(background && !nearBottom);
+    renderThreadHistory(!currentThreadHasRendered ? 'initial' : nearBottom ? 'bottom' : 'position');
+    currentThreadHasRendered = true;
   }
   renderDetailPending();
+  return true;
 }
 
-async function openThread(id, background = false, historyMode = 'push') {
+async function requestLatestThreadPage(threadId, attempts) {
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    let request = latestThreadRequests.get(threadId);
+    if (!request) {
+      request = api(
+        `/threads/${encodeURIComponent(threadId)}?paged=true&limit=${turnPageSize}`,
+        { suppressDiagnostic: true });
+      latestThreadRequests.set(threadId, request);
+      request.finally(() => {
+        if (latestThreadRequests.get(threadId) === request) latestThreadRequests.delete(threadId);
+      }).catch(() => { /* The original await handles the request error. */ });
+    }
+    try {
+      return await request;
+    } catch (error) {
+      lastError = error;
+      if (!retryableThreadError(error) || attempt + 1 >= attempts) throw error;
+      await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 350 : 900));
+    }
+  }
+  throw lastError;
+}
+
+async function refreshCurrentThread(background = false, force = false) {
+  if (!currentThread) return;
+  if (background && (document.visibilityState !== 'visible' || !$('#threadDetail').classList.contains('active'))) return;
+  const threadId = currentThread;
+  const retry = threadRetryStates.get(threadId);
+  if (background && !force && retry?.nextRetryAt > Date.now()) return false;
+  let result;
+  try {
+    result = await requestLatestThreadPage(threadId, background ? 1 : 3);
+  } catch (error) {
+    if (threadId !== currentThread) return false;
+    recordThreadFailure(threadId, error);
+    const cached = threadPageCache.has(threadId) || currentTurns.length > 0;
+    if (!cached) $('#turns').innerHTML = empty('消息暂时无法读取，系统会自动重试');
+    renderThreadLoadState(error, cached, false);
+    return false;
+  }
+  if (threadId !== currentThread) return false;
+  clearThreadFailure(threadId);
+  cacheThreadPage(threadId, result);
+  applyThreadPage(result, threadId, background);
+  renderThreadLoadState();
+  return true;
+}
+
+async function openTask(id, background = false, historyMode = 'push') {
+  if (id === 'commute') {
+    window.location.assign('/commute/');
+    return;
+  }
   const switching = id !== currentThread;
   if (switching) {
     saveDraft();
     currentThread = id;
     currentThreadCwd = '';
     currentTurnCursor = '';
-    currentRuntimeState = null;
+    currentTurns = [];
+    hasEarlierTurns = false;
+    currentRuntimeState = normalizedRuntimeState({ id, status: { type: 'notLoaded' } });
     toolsLoadedFor = '';
     availableTools = [];
     currentThreadSignature = '';
     currentActiveTurnId = '';
+    liveRevision = 0;
+    renderedTurnSignatures.clear();
+    renderedBlockSignatures.clear();
+    clearNewMessages();
+    lastDeliveryReceipt = null;
+    currentThreadHasRendered = false;
     loadDraft();
   }
   if (!background) {
@@ -2592,14 +3772,19 @@ async function openThread(id, background = false, historyMode = 'push') {
     }
     commitNavigation('threadDetail', id, historyMode);
     renderPage('threadDetail');
-    $('#turns').innerHTML = empty('加载中');
+    startLiveFeed(id);
+    const cached = cachedThreadPage(id);
+    if (cached) {
+      applyThreadPage(cached.result, id, false);
+      renderThreadLoadState(null, true, true);
+    } else {
+      $('#detailTitle').textContent = '任务';
+      $('#turns').innerHTML = empty('正在加载最新消息');
+      renderThreadLoadState(null, false, true);
+    }
   }
-  try {
-    await refreshCurrentThread(background);
-  } catch (error) {
-    if (!background) $('#turns').innerHTML = empty('加载失败，请点击右上角刷新后重试');
-    toast(error.message);
-  }
+  if ($('#threadDetail').classList.contains('active')) startLiveFeed(id);
+  return refreshCurrentThread(background);
 }
 
 document.querySelectorAll('.intent').forEach(button => {
@@ -2670,11 +3855,33 @@ $('#diagnosticCopy').onclick = async () => {
 };
 $('#diagnosticRefresh').onclick = async () => {
   try {
-    await load();
-    if (currentThread) await refreshCurrentThread(false);
-    $('#diagnostic').classList.add('hidden');
-    toast('已重新加载');
+    let ok = true;
+    if (currentThread && $('#threadDetail').classList.contains('active')) {
+      ok = await refreshCurrentThread(false, true);
+    } else {
+      await load();
+    }
+    if (ok !== false) {
+      $('#diagnostic').classList.add('hidden');
+      toast('已重新加载');
+    } else {
+      toast('仍未读取成功，电脑端任务可能还在继续');
+    }
   } catch (error) { toast(error.message); }
+};
+
+$('#threadLoadRetry').onclick = async () => {
+  $('#threadLoadRetry').disabled = true;
+  try {
+    const ok = await refreshCurrentThread(false, true);
+    toast(ok ? '已读取最新内容' : '仍未连接成功，稍后会自动重试');
+  } finally {
+    $('#threadLoadRetry').disabled = false;
+  }
+};
+
+$('#threadLoadDetails').onclick = () => {
+  if (currentThreadLoadError) showDiagnostic(currentThreadLoadError);
 };
 
 ['#message', '#messageScope', '#messagePolicy', '#messageDone'].forEach(selector => {
@@ -2695,6 +3902,8 @@ async function handleExecutionSelectionChange() {
 
 $('#runtimePermission').addEventListener('change', handleExecutionSelectionChange);
 $('#approvalMode').addEventListener('change', handleExecutionSelectionChange);
+$('#modelChoice').addEventListener('change', handleModelChoiceChange);
+$('#reasoningEffort').addEventListener('change', saveModelSettings);
 document.querySelectorAll('[data-execution-preset]').forEach(button => {
   button.addEventListener('click', () => applyExecutionPreset(button.dataset.executionPreset));
 });
@@ -2722,10 +3931,6 @@ $('#message').addEventListener('keydown', event => {
 $('#composer').onsubmit = async event => {
   event.preventDefault();
   if (sending || !currentThread) return;
-  if (currentRuntimeState?.isRunning === true && currentRuntimeState?.canControl === false) {
-    toast('当前轮次正在运行，结束后即可从手机续接');
-    return;
-  }
   const rawCommand = $('#message').value.trim();
   if (/^\/skills?$/i.test(rawCommand) || rawCommand === '/tools' || /^\$[^\s]*$/.test(rawCommand)) {
     await openCommandPanel(rawCommand.startsWith('$') ? rawCommand.slice(1) : '');
@@ -2739,8 +3944,20 @@ $('#composer').onsubmit = async event => {
   if (!(await confirmExecutionSettings())) return;
   const threadId = currentThread;
   const activeTurnId = currentActiveTurnId;
+  if (activeTurnId && !confirm('当前任务仍在运行。现在发送会插入当前轮次，并可能改变正在执行的步骤。\n\n如果只是等待任务完成，请选择取消。')) {
+    return;
+  }
   const skills = selectedSkills.map(skill => ({ name: skill.name, path: skill.path }));
   sending = true;
+  forceFollowNextRender = true;
+  lastDeliveryReceipt = {
+    threadId,
+    createdAt: Date.now(),
+    status: 'sending',
+    queued: false,
+    message: '正在交给电脑端'
+  };
+  updateComposerState();
   $('#sendMessage').disabled = true;
   $('#commandTrigger').disabled = true;
   $('#attachmentInput').disabled = true;
@@ -2755,28 +3972,32 @@ $('#composer').onsubmit = async event => {
       attachmentIds: uploadedFiles.map(file => file.id),
       skills,
       clientUserMessageId: messageId(),
-      ...executionSettings()
+      browserRequired: selectedTools.includes('browser'),
+      ...executionSettings(),
+      ...modelSettings.requestFields(currentModelSettings())
     };
+    let dispatch;
     if (activeTurnId) {
-      try {
-        await api(`/threads/${encodeURIComponent(threadId)}/steer`, {
-          method: 'POST', body: { turnId: activeTurnId, ...payload }
-        });
-      } catch (error) {
-        if (![400, 404, 409].includes(error.status)) throw error;
-        await api(`/threads/${encodeURIComponent(threadId)}/messages`, {
-          method: 'POST', body: payload
-        });
-      }
+      // The bridge reconciles a stale turn id against the current app-server
+      // state under a per-thread lock. Do not fall back to a second request
+      // here: clientUserMessageId is correlation metadata, not an idempotency
+      // key, so a response lost after dispatch could otherwise duplicate work.
+      dispatch = await api(`/threads/${encodeURIComponent(threadId)}/steer`, {
+        method: 'POST', body: { turnId: activeTurnId, ...payload }
+      });
     } else {
-      await api(`/threads/${encodeURIComponent(threadId)}/messages`, {
+      dispatch = await api(`/threads/${encodeURIComponent(threadId)}/messages`, {
         method: 'POST', body: payload
       });
     }
+    const receipt = threadStream.deliveryReceiptPresentation(dispatch, Boolean(activeTurnId));
+    lastDeliveryReceipt = { ...receipt, threadId, createdAt: Date.now() };
     if (threadId === currentThread) clearDraft();
-    toast(activeTurnId ? '补充指令已发送' : '指令已发送');
+    toast(receipt.message);
+    updateComposerState();
     await refreshCurrentThread(true);
   } catch (error) {
+    lastDeliveryReceipt = null;
     toast(error.message);
     saveDraft();
   } finally {
@@ -2806,24 +4027,196 @@ $('#interruptTurn').onclick = async () => {
   }
 };
 
-async function startThread(path) {
+async function refreshBrowserStatus() {
   try {
-    if (!(await confirmExecutionSettings())) return;
+    const result = await api('/browser/status', { suppressDiagnostic: true });
+    renderBrowserStatus(result);
+    return result;
+  } catch (error) {
+    renderBrowserStatus({ state: 'error', message: error.message, running: false, starting: false });
+    throw error;
+  }
+}
+
+async function startBrowserFromPhone(showSuccess = true) {
+  if (browserBusy) return browserStatus;
+  browserBusy = true;
+  renderBrowserStatus({ ...browserStatus, starting: !browserStatus.running });
+  try {
+    const result = await api('/browser/start', {
+      method: 'POST',
+      body: {},
+      suppressDiagnostic: true,
+      timeoutMs: 15000
+    });
+    renderBrowserStatus(result);
+    if (!result?.running) throw new Error(result?.message || '电脑端没有确认 Chrome 已启动');
+    if (showSuccess) toast(`${result.browserName || 'Chrome'} 已在电脑上运行`);
+    return result;
+  } finally {
+    browserBusy = false;
+    renderBrowserStatus(browserStatus);
+  }
+}
+
+function openRemoteWorkPanel() {
+  showPage('remote');
+  refreshBrowserStatus().catch(() => { /* The status card already explains the failure. */ });
+  requestAnimationFrame(() => $('#remoteWorkGoal').focus());
+}
+
+function remoteWorkPrompt(goal, url) {
+  return [
+    '这是从手机端“远程办事”入口发起的独立任务。',
+    `目标：${goal}`,
+    url ? `起始网页：${url}` : '',
+    '操作方式：请使用 computer-use 或浏览器控制能力，操作这台电脑上已经登录的 Chrome；先检查已有标签页和登录状态，再按目标继续。',
+    '执行边界：可以自主完成搜索、比较、浏览、填写草稿、整理材料和加入购物车等可逆步骤。遇到付款、最终提交、验证码、创建账号、发送对外消息、删除内容或其他不可逆操作时，必须停在确认前，并在手机端清楚说明将要发生什么。',
+    '如果 Chrome 或浏览器控制组件尚未就绪，请先诊断并恢复；不要因为手机页面断开而停止电脑端任务。',
+    '完成后请汇报已经完成的步骤、仍需我确认的事项和可核对的结果。'
+  ].filter(Boolean).join('\n');
+}
+
+async function startRemoteWork(event) {
+  event.preventDefault();
+  if (remoteWorkBusy) return;
+  const goal = $('#remoteWorkGoal').value.trim();
+  const url = $('#remoteWorkUrl').value.trim();
+  if (!goal) {
+    $('#remoteWorkGoal').focus();
+    return;
+  }
+  if (!(await confirmExecutionSettings())) return;
+
+  remoteWorkBusy = true;
+  $('#remoteWorkSubmit').disabled = true;
+  $('#remoteWorkSubmit').textContent = '正在连接电脑…';
+  renderBrowserStatus(browserStatus);
+  let threadId = '';
+  try {
+    await startBrowserFromPhone(false);
+    $('#remoteWorkSubmit').textContent = '正在建立任务…';
+    const created = await api('/threads', {
+      method: 'POST',
+      body: { cwd: null, ...executionSettings() }
+    });
+    threadId = created.thread?.id || created.id || '';
+    if (!threadId) throw new Error('电脑端没有返回新任务编号');
+
+    $('#remoteWorkSubmit').textContent = '正在发送任务…';
+    const dispatch = await api(`/threads/${encodeURIComponent(threadId)}/messages`, {
+      method: 'POST',
+      body: {
+        text: remoteWorkPrompt(goal, url),
+        clientUserMessageId: messageId(),
+        attachmentIds: [],
+        skills: [],
+        browserRequired: true,
+        ...executionSettings(),
+        ...modelSettings.requestFields(currentModelSettings())
+      }
+    });
+
+    $('#remoteWorkGoal').value = '';
+    $('#remoteWorkUrl').value = '';
+    await openTask(threadId);
+    const receipt = threadStream.deliveryReceiptPresentation(dispatch, false);
+    lastDeliveryReceipt = { ...receipt, threadId, createdAt: Date.now() };
+    updateComposerState();
+    toast('远程办事任务已在电脑端开始');
+  } catch (error) {
+    toast(error.message);
+    if (threadId) {
+      await openTask(threadId);
+    }
+  } finally {
+    remoteWorkBusy = false;
+    $('#remoteWorkSubmit').disabled = false;
+    $('#remoteWorkSubmit').textContent = '启动 Chrome 并开始';
+    renderBrowserStatus(browserStatus);
+  }
+}
+
+document.querySelectorAll('[data-remote-example]').forEach(button => {
+  button.onclick = () => {
+    const input = $('#remoteWorkGoal');
+    if (!input.value.trim()) input.value = button.dataset.remoteExample;
+    input.focus();
+  };
+});
+$('#remoteWorkForm').onsubmit = startRemoteWork;
+$('#startBrowser').onclick = async () => {
+  try { await startBrowserFromPhone(true); }
+  catch (error) { toast(error.message); }
+};
+$('#browserAutoStart').addEventListener('change', async event => {
+  if (browserBusy) return;
+  const enabled = event.target.checked;
+  browserBusy = true;
+  renderBrowserStatus(browserStatus);
+  try {
+    const result = await api('/browser/settings', {
+      method: 'POST',
+      body: { autoStartWithBridge: enabled },
+      suppressDiagnostic: true
+    });
+    renderBrowserStatus(result);
+    toast(enabled ? 'Chrome 会随 Bridge 静默启动' : '已关闭随 Bridge 启动');
+  } catch (error) {
+    renderBrowserStatus({ ...browserStatus, autoStartWithBridge: !enabled });
+    toast(error.message);
+  } finally {
+    browserBusy = false;
+    renderBrowserStatus(browserStatus);
+  }
+});
+
+async function startThread(path) {
+  if (newTaskBusy) return;
+  newTaskBusy = true;
+  const dialog = $('#newTaskDialog');
+  const wasOpen = dialog.open;
+  $('#createNewTask').disabled = true;
+  $('#newTaskError').textContent = '';
+  // Close the modal before a permission confirmation so that it cannot cover it.
+  if (wasOpen) dialog.close();
+  try {
+    if (!(await confirmExecutionSettings())) {
+      if (wasOpen) dialog.showModal();
+      return;
+    }
     const result = await api('/threads', { method: 'POST', body: { cwd: path, ...executionSettings() } });
     const id = result.thread?.id || result.id;
-    if (id) openThread(id);
+    if (id) await openTask(id);
     else {
       toast('任务已建立');
       load();
     }
   } catch (error) {
-    toast(error.message);
+    $('#newTaskError').textContent = error.message;
+    if (wasOpen && !dialog.open) dialog.showModal();
+    else toast(error.message);
+  } finally {
+    newTaskBusy = false;
+    $('#createNewTask').disabled = false;
   }
 }
 
 $('#newThread').onclick = () => {
-  const path = prompt('项目的 Windows 文件夹路径：');
-  if (path) startThread(path);
+  $('#newTaskError').textContent = '';
+  $('#newTaskDialog').showModal();
+};
+$('#closeNewTask').onclick = () => $('#newTaskDialog').close();
+$('#newTaskForm').onsubmit = event => {
+  event.preventDefault();
+  startThread($('#newTaskPath').value.trim() || null);
+};
+$('#projectList').onclick = event => {
+  const choice = event.target.closest('[data-project-path]');
+  if (!choice) return;
+  $('#newTaskPath').value = choice.dataset.projectPath;
+  $('#projectPicker').open = false;
+  $('#createNewTask').focus();
 };
 
 async function approval(key, decision) {
@@ -2905,14 +4298,12 @@ async function setAutoApproveAll(enabled) {
   }
 }
 
-$('#approveRecent').onclick = approveAllPending;
 $('#approveAllPending').onclick = approveAllPending;
 $('#autoApproveAll').addEventListener('change', event => {
   const enabled = event.target.checked;
   event.target.checked = approvalAutomation.autoApproveAll === true;
   setAutoApproveAll(enabled);
 });
-$('#manageAutoApprove').onclick = () => showPage('approvals');
 
 async function stopProcess(pid) {
   const confirmation = prompt(`停止 PID ${pid} 会中断其工作。请输入 STOP ${pid} 确认：`);
@@ -2920,17 +4311,25 @@ async function stopProcess(pid) {
   try {
     await api('/processes/' + pid + '/stop', { method: 'POST', body: { confirmation } });
     toast('停止指令已执行');
-    load();
+    await load();
+    if (activePage() === 'processes') await loadConsoleLaunches();
+    return true;
   } catch (error) {
     toast(error.message);
+    return false;
   }
 }
 
 $('#refresh').onclick = async () => {
   if (currentThread && $('#threadDetail').classList.contains('active')) await refreshCurrentThread(false);
-  await Promise.all([load(), loadApprovalSettings()]);
+  const requests = [load(), loadApprovalSettings()];
+  if (activePage() === 'processes') requests.push(loadConsoleLaunches());
+  await Promise.all(requests);
 };
-$('#reloadProcesses').onclick = () => load();
+$('#reloadProcesses').onclick = () => Promise.all([load(), loadConsoleLaunches()]);
+$('#reloadConsoleAudit').onclick = () => loadConsoleLaunches();
+$('#toggleConsoleAudit').onclick = () => setConsoleAuditCapturing(consoleAuditState.capturing !== true);
+$('#clearConsoleAudit').onclick = () => clearConsoleAudit();
 
 $('#notificationAction').onclick = async () => {
   const mode = $('#notificationAction').dataset.mode;
@@ -2973,7 +4372,7 @@ async function boot() {
       if (nativeConfigured) token = '';
       refreshNativeNotificationStatus();
     }
-    await Promise.all([load(), loadApprovalSettings()]);
+    await Promise.all([load(), loadApprovalSettings(), loadModelCatalog()]);
     await restoreNavigation(history.state, true);
   } catch (error) {
     if (error.status === 401) $('#pair').classList.remove('hidden');
@@ -2982,6 +4381,7 @@ async function boot() {
 }
 
 loadExecutionSettings();
+loadModelSettings();
 initializeNavigation();
 refreshNativeNotificationStatus();
 boot();
@@ -2994,7 +4394,9 @@ async function pollVisiblePage(force = false) {
   }
   const page = activePage();
   if (page === 'threadDetail') {
-    if (currentThread && !sending) {
+    if (threadStream.shouldPollThreadDetail({
+      visible: document.visibilityState === 'visible', authenticated, page, threadId: currentThread, sending
+    })) {
       const detailInterval = currentRuntimeState?.isRunning === true ? 6000 : 15000;
       if (force || now - (lastThreadRefreshAt.get(currentThread) || 0) >= detailInterval) {
         try { await refreshCurrentThread(true); } catch { /* The next poll will retry. */ }
@@ -3017,4 +4419,16 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
+if ('serviceWorker' in navigator) {
+  const hadController = Boolean(navigator.serviceWorker.controller);
+  let reloadingForUpgrade = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController || reloadingForUpgrade) return;
+    reloadingForUpgrade = true;
+    location.reload();
+  });
+  navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' }).then(registration => {
+    registration.waiting?.postMessage('SKIP_WAITING');
+    registration.update().catch(() => { /* A later page load will retry the upgrade. */ });
+  }).catch(() => { /* The Console still works online without an offline cache. */ });
+}

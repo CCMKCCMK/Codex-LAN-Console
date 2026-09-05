@@ -2,10 +2,9 @@
 
 ## Copyright
 
-Copyright (c) 2026 Wenchang Chai. All rights reserved.
+Copyright (c) 2026 Wenchang Chai.
 
-The original project code is proprietary during the private-preview period.
-See LICENSE and BETA_EULA.md.
+The original project code is MIT licensed as of 1.9.0. See LICENSE.
 
 ## Independent project
 
@@ -18,8 +17,7 @@ logos, and marks are the property of their respective owners. Their appearance
 describes compatibility or the author’s personal affiliation only. It does not
 grant this project a trademark license or imply institutional endorsement.
 
-The current product name is a private-preview working name and must undergo a
-trademark and branding review before any public release.
+The product name describes compatibility, not official origin or endorsement.
 
 ## Security notice
 

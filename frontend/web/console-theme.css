@@ -1,0 +1,62 @@
+/* Shared by Console and Commute. Keep product chrome and colors in one place. */
+:root {
+  color-scheme: dark;
+  --bg: #0c0f0e;
+  --panel: #151a18;
+  --panel-raised: #19201d;
+  --field: #111513;
+  --line: #29312e;
+  --line-strong: #3a4842;
+  --text: #f2f6f4;
+  --muted: #91a09a;
+  --green: #7bf1bd;
+  --green-ink: #082016;
+  --green-soft: #193228;
+  --red: #ff7e79;
+  --red-soft: #3a1f20;
+  --warning: #ffd68b;
+  --warning-soft: #302718;
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --nav-height: calc(72px + var(--safe-bottom));
+  --radius: 15px;
+  --font-ui: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.console-header {
+  position: sticky; top: 0; z-index: 10; display: flex; align-items: center;
+  justify-content: space-between; width: 100%; height: 76px; padding: 14px 18px;
+  border-bottom: 1px solid var(--line); background: rgba(12,15,14,.94);
+  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+}
+.console-header h1 {
+  margin: 0; max-width: calc(100vw - 108px); overflow: hidden;
+  font: 700 20px/1.2 var(--font-ui); text-overflow: ellipsis; white-space: nowrap;
+}
+.console-header .eyebrow { display: block; margin: 0 0 3px; color: var(--green); font-size: 9px; letter-spacing: 2px; }
+.console-header .icon { flex: 0 0 auto; min-width: 46px; min-height: 42px; padding: 7px 13px; border: 0; border-radius: 12px; background: var(--panel); color: var(--text); font: 700 22px var(--font-ui); }
+.console-nav {
+  position: fixed; inset: auto 0 0; z-index: 9; display: flex; justify-content: center;
+  width: 100%; height: var(--nav-height); padding: 0 0 var(--safe-bottom);
+  overflow: hidden; border-top: 1px solid var(--line); background: rgba(16,20,18,.97);
+  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+}
+.console-nav > a, .console-nav > button {
+  flex: 1 1 0; max-width: 150px; min-width: 0; min-height: 56px; padding: 7px 2px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 0; border: 0; border-radius: 0; background: transparent; color: var(--muted);
+  font: 700 18px/1.45 var(--font-ui); text-align: center; text-decoration: none;
+}
+.console-nav > .active { color: var(--green); }
+.console-nav span { display: block; margin-top: 3px; font-size: 13px; white-space: nowrap; }
+.console-nav :focus-visible, .console-header :focus-visible { outline: 2px solid var(--green); outline-offset: -3px; }
+.native-shell { --native-top: max(env(safe-area-inset-top, 0px), 32px); }
+.native-shell .console-header { height: calc(76px + var(--native-top)); padding-top: calc(14px + var(--native-top)); }
+@media (max-width:699px) { .console-header { position: fixed; } }
+.notification-route-notice {
+  position: fixed; z-index: 20; left: 12px; right: 12px; bottom: calc(var(--nav-height) + 12px);
+  display: flex; align-items: center; gap: 10px; max-width: 620px; margin: auto;
+  padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px;
+  background: var(--panel); color: var(--text); box-shadow: 0 6px 24px #0005;
+  font: 13px/1.5 var(--font-ui);
+}
+.notification-route-notice span { flex: 1; min-width: 0; }
+.notification-route-notice button { flex: 0 0 auto; width: auto; min-height: 40px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 10px; background: transparent; color: var(--green); font: inherit; }

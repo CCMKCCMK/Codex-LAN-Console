@@ -27,14 +27,22 @@ public sealed class FileTransferService : BackgroundService
     private static readonly TimeSpan UploadRetention = TimeSpan.FromDays(30);
     private readonly string _uploadRoot;
     private readonly string _registryPath;
+    private readonly string _codexHome;
     private readonly ConcurrentDictionary<string, StoredFileLease> _leases = new(StringComparer.Ordinal);
     private readonly object _registryGate = new();
     private readonly FileExtensionContentTypeProvider _contentTypes = new();
 
     public FileTransferService()
+        : this(DefaultUploadRoot(), DefaultCodexHome())
     {
-        var appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        _uploadRoot = Path.Combine(appData, "CodexLanConsole", "Uploads");
+    }
+
+    public FileTransferService(string uploadRoot, string codexHome)
+    {
+        if (string.IsNullOrWhiteSpace(uploadRoot)) throw new ArgumentException("An upload path is required.");
+        if (string.IsNullOrWhiteSpace(codexHome)) throw new ArgumentException("A Codex home path is required.");
+        _uploadRoot = Path.GetFullPath(uploadRoot);
+        _codexHome = Path.GetFullPath(codexHome);
         _registryPath = Path.Combine(_uploadRoot, "leases.json");
         Directory.CreateDirectory(_uploadRoot);
         LoadRegistry();
@@ -140,11 +148,25 @@ public sealed class FileTransferService : BackgroundService
                 File.Exists(item.AbsolutePath));
             if (existing is not null) return ToDescriptor(existing);
         }
-        var workspaceRoot = CanonicalDirectory(allowedWorkspaceRoot);
-        var fullPath = CanonicalFile(Path.IsPathRooted(path) ? path : Path.Combine(workspaceRoot, path));
-        EnsureWithinRoot(fullPath, workspaceRoot);
-        EnsureNoReparsePoints(workspaceRoot, fullPath);
-        var leaseRoot = Path.GetDirectoryName(fullPath) ?? workspaceRoot;
+        var rooted = Path.IsPathRooted(path);
+        string? workspaceRoot = null;
+        if (!rooted || Directory.Exists(allowedWorkspaceRoot))
+            workspaceRoot = CanonicalDirectory(allowedWorkspaceRoot);
+
+        var fullPath = CanonicalFile(rooted ? path : Path.Combine(workspaceRoot!, path));
+        string allowedRoot;
+        if (workspaceRoot is not null && IsWithinRoot(fullPath, workspaceRoot))
+        {
+            allowedRoot = workspaceRoot;
+        }
+        else if (!TryGetTrustedArtifactRoot(fullPath, threadId, out allowedRoot))
+        {
+            if (workspaceRoot is null)
+                throw new DirectoryNotFoundException("The task workspace no longer exists, and the file is not in its Codex delivery folder.");
+            throw new UnauthorizedAccessException("The file is outside the task workspace and its Codex delivery folder.");
+        }
+        EnsureNoReparsePoints(allowedRoot, fullPath);
+        var leaseRoot = Path.GetDirectoryName(fullPath) ?? allowedRoot;
         var entry = Path.GetFileName(fullPath);
         var now = DateTimeOffset.UtcNow;
         var id = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
@@ -164,6 +186,79 @@ public sealed class FileTransferService : BackgroundService
         _leases[id] = stored;
         SaveRegistry();
         return ToDescriptor(stored);
+    }
+
+    public async Task<FileLeaseDescriptor> StoreThreadDeliveryAsync(
+        string sourcePath,
+        string threadId,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(threadId)) throw new ArgumentException("A task id is required.");
+        var source = CanonicalFile(sourcePath);
+        var sourceInfo = new FileInfo(source);
+        if (sourceInfo.Length > MaximumFileBytes)
+            throw new ArgumentException($"The delivery file must be no larger than {MaximumFileBytes / 1024 / 1024} MiB.");
+        if ((sourceInfo.Attributes & FileAttributes.ReparsePoint) != 0)
+            throw new UnauthorizedAccessException("Linked files cannot be shared.");
+
+        var id = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+        var directory = Path.Combine(_uploadRoot, id);
+        Directory.CreateDirectory(directory);
+        var originalName = SafeDisplayName(sourceInfo.Name);
+        var physicalName = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant() +
+                           SafeExtension(originalName);
+        var destination = Path.Combine(directory, physicalName);
+        var partial = destination + ".part";
+        try
+        {
+            await using (var input = new FileStream(
+                             source,
+                             FileMode.Open,
+                             FileAccess.Read,
+                             FileShare.Read | FileShare.Delete,
+                             64 * 1024,
+                             FileOptions.Asynchronous | FileOptions.SequentialScan))
+            await using (var output = new FileStream(
+                             partial,
+                             FileMode.CreateNew,
+                             FileAccess.Write,
+                             FileShare.None,
+                             64 * 1024,
+                             FileOptions.Asynchronous | FileOptions.SequentialScan))
+            {
+                await input.CopyToAsync(output, 64 * 1024, cancellationToken);
+            }
+            File.Move(partial, destination);
+
+            var now = DateTimeOffset.UtcNow;
+            var stored = new StoredFileLease(
+                id,
+                originalName,
+                destination,
+                directory,
+                physicalName,
+                ContentType(originalName),
+                new FileInfo(destination).Length,
+                threadId,
+                true,
+                now,
+                now.Add(UploadRetention));
+            _leases[id] = stored;
+            SaveRegistry();
+            return ToDescriptor(stored);
+        }
+        catch
+        {
+            try { if (File.Exists(partial)) File.Delete(partial); } catch { }
+            try
+            {
+                if (Directory.Exists(directory) &&
+                    (File.GetAttributes(directory) & FileAttributes.ReparsePoint) == 0)
+                    Directory.Delete(directory, true);
+            }
+            catch { }
+            throw;
+        }
     }
 
     public IReadOnlyList<FileLeaseDescriptor> List(string? threadId)
@@ -195,6 +290,11 @@ public sealed class FileTransferService : BackgroundService
         if (Path.IsPathRooted(requested)) throw new ArgumentException("The file path is outside this lease.");
         var path = Path.GetFullPath(Path.Combine(root, requested));
         EnsureWithinRoot(path, root);
+        if (!string.Equals(
+                path,
+                Path.GetFullPath(stored.AbsolutePath),
+                OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+            throw new UnauthorizedAccessException("Only the leased file can be viewed.");
         if (!File.Exists(path)) throw new FileNotFoundException("The requested file does not exist.");
         EnsureNoReparsePoints(root, path);
         return new ResolvedFileLease(ToDescriptor(stored), path, ContentType(path));
@@ -278,6 +378,21 @@ public sealed class FileTransferService : BackgroundService
             : "";
     }
 
+    private static string DefaultUploadRoot()
+    {
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        return Path.Combine(appData, "CodexLanConsole", "Uploads");
+    }
+
+    private static string DefaultCodexHome()
+    {
+        var configured = Environment.GetEnvironmentVariable("CODEX_HOME");
+        if (!string.IsNullOrWhiteSpace(configured)) return configured;
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".codex");
+    }
+
     private static string CanonicalDirectory(string path)
     {
         if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("A workspace path is required.");
@@ -289,15 +404,72 @@ public sealed class FileTransferService : BackgroundService
     private static string CanonicalFile(string path)
     {
         var full = Path.GetFullPath(path);
+        RejectAlternateDataStream(full);
         if (!File.Exists(full)) throw new FileNotFoundException("The requested file does not exist.");
         return full;
     }
 
+    private static void RejectAlternateDataStream(string path)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var root = Path.GetPathRoot(path) ?? "";
+        if (path.AsSpan(root.Length).Contains(':'))
+            throw new ArgumentException("Windows alternate data streams cannot be shared.");
+    }
+
     private static void EnsureWithinRoot(string path, string root)
     {
-        var relative = Path.GetRelativePath(root, path);
-        if (relative.Equals("..", StringComparison.Ordinal) || relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal) || Path.IsPathRooted(relative))
+        if (!IsWithinRoot(path, root))
             throw new UnauthorizedAccessException("The file is outside the task workspace.");
+    }
+
+    private static bool IsWithinRoot(string path, string root)
+    {
+        var relative = Path.GetRelativePath(root, path);
+        return !relative.Equals("..", StringComparison.Ordinal) &&
+               !relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal) &&
+               !relative.StartsWith(".." + Path.AltDirectorySeparatorChar, StringComparison.Ordinal) &&
+               !Path.IsPathRooted(relative);
+    }
+
+    private bool TryGetTrustedArtifactRoot(string path, string threadId, out string root)
+    {
+        root = "";
+        if (string.IsNullOrWhiteSpace(threadId) ||
+            threadId.IndexOfAny([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar]) >= 0)
+            return false;
+
+        var visualizations = Path.Combine(_codexHome, "visualizations");
+        if (!Directory.Exists(visualizations)) return false;
+        visualizations = CanonicalDirectory(visualizations);
+        if (!IsWithinRoot(path, visualizations)) return false;
+
+        var relative = Path.GetRelativePath(visualizations, path);
+        var parts = relative.Split(
+            [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+            StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 5 ||
+            parts[0].Length != 4 || !parts[0].All(char.IsAsciiDigit) ||
+            parts[1].Length != 2 || !parts[1].All(char.IsAsciiDigit) ||
+            parts[2].Length != 2 || !parts[2].All(char.IsAsciiDigit) ||
+            !string.Equals(parts[3], threadId, StringComparison.Ordinal))
+            return false;
+
+        if (!DateOnly.TryParseExact(
+                $"{parts[0]}-{parts[1]}-{parts[2]}",
+                "yyyy-MM-dd",
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None,
+                out _))
+            return false;
+
+        var candidate = Path.Combine(visualizations, parts[0], parts[1], parts[2], parts[3]);
+        if (!Directory.Exists(candidate)) return false;
+        candidate = CanonicalDirectory(candidate);
+        if (!IsWithinRoot(path, candidate)) return false;
+        EnsureNoReparsePoints(visualizations, path);
+        root = candidate;
+        return true;
     }
 
     private static void EnsureNoReparsePoints(string root, string path)
